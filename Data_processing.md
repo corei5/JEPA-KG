@@ -433,12 +433,7 @@ See the `LICENSE` file for details.
 # ⭐ Citation
 
 ```bibtex
-@software{jepa_kg_processing_2026,
-  title={JEPA-KG: Data Processing Layer},
-  author={Your Organization},
-  year={2026},
-  url={https://github.com/your-org/jepa-kg}
-}
+
 ```
 
 ---
