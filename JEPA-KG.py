@@ -10,19 +10,36 @@ Capabilities:
   4. Predict likely data-quality defects before they surface
   5. Simulate business impact of changing a supplier, material, policy, or workflow
 
+Data Ingestion (NEW):
+  - CSV files (subject, predicate, object columns + optional metadata)
+  - Turtle / TTL files (RDF Knowledge Graph format)
+  - N-Triples (.nt) files
+  - JSON / JSON-LD files
+  - RDF/XML files
+  - Auto-detection by file extension
+
 Requirements:
-  pip install torch transformers peft accelerate bitsandbytes datasets rich
+  pip install torch transformers peft accelerate bitsandbytes datasets rich rdflib pandas
 
 Usage:
   python enterprise_world_model.py
 """
 
+from __future__ import annotations
+
+import csv
+import io
 import json
+import logging
+import os
+import re
 import textwrap
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
@@ -35,6 +52,18 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+# RDFLib for TTL / N-Triples / JSON-LD / RDF-XML
+try:
+    from rdflib import Graph as RDFGraph, URIRef, Literal, BNode
+    from rdflib.namespace import RDF, RDFS, OWL
+    RDFLIB_AVAILABLE = True
+except ImportError:
+    RDFLIB_AVAILABLE = False
+    logging.warning(
+        "rdflib not found. TTL/N-Triples/RDF-XML/JSON-LD ingestion disabled. "
+        "Install with: pip install rdflib"
+    )
 
 console = Console()
 
@@ -78,9 +107,9 @@ class TaskType(str, Enum):
 
 @dataclass
 class KGTriple:
-    subject: str
+    subject:   str
     predicate: str
-    obj: str
+    obj:       str
 
     def __str__(self) -> str:
         return f"({self.subject}, {self.predicate}, {self.obj})"
@@ -89,15 +118,15 @@ class KGTriple:
 @dataclass
 class EnterpriseContext:
     """Structured enterprise context fed into the world model."""
-    task_type: TaskType
-    triples: list[KGTriple]
+    task_type:   TaskType
+    triples:     List[KGTriple]
     observation: str
-    constraints: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    constraints: List[str] = field(default_factory=list)
+    metadata:    Dict[str, Any] = field(default_factory=dict)
 
     def serialize(self) -> str:
         kg_tok = MODALITY_TOKENS
-        kg_block = " ".join(str(t) for t in self.triples)
+        kg_block        = " ".join(str(t) for t in self.triples)
         constraint_block = "; ".join(self.constraints) if self.constraints else "none"
         return (
             f"{kg_tok['kg_start']} {kg_block} {kg_tok['kg_end']} "
@@ -108,12 +137,485 @@ class EnterpriseContext:
 
 
 # ---------------------------------------------------------------------------
-# 4. PREDEFINED ENTERPRISE SCENARIOS
+# 4. DATA PROCESSING — MULTI-FORMAT INGESTION  (NEW)
 # ---------------------------------------------------------------------------
 
-SCENARIOS: dict[TaskType, EnterpriseContext] = {
+class KGFileFormat(str, Enum):
+    CSV      = "csv"
+    TURTLE   = "ttl"
+    NTRIPLES = "nt"
+    JSONLD   = "jsonld"
+    RDFXML   = "xml"
+    JSON     = "json"
+    AUTO     = "auto"
 
-    # -----------------------------------------------------------------------
+
+# Mapping file extension → KGFileFormat
+_EXT_MAP: Dict[str, KGFileFormat] = {
+    ".csv":     KGFileFormat.CSV,
+    ".ttl":     KGFileFormat.TURTLE,
+    ".turtle":  KGFileFormat.TURTLE,
+    ".nt":      KGFileFormat.NTRIPLES,
+    ".jsonld":  KGFileFormat.JSONLD,
+    ".json":    KGFileFormat.JSON,
+    ".xml":     KGFileFormat.RDFXML,
+    ".rdf":     KGFileFormat.RDFXML,
+    ".owl":     KGFileFormat.RDFXML,
+}
+
+
+def _clean_uri(value: str) -> str:
+    """
+    Strip URI brackets and namespace prefixes to produce human-readable labels.
+    E.g.  <http://example.org/ontology#Supplier_A>  →  Supplier_A
+          "6 weeks"^^xsd:string                     →  6_weeks
+    """
+    # Remove angle brackets
+    value = value.strip().lstrip("<").rstrip(">")
+    # Keep only the local name after # or /
+    for sep in ("#", "/"):
+        if sep in value:
+            value = value.rsplit(sep, 1)[-1]
+    # Remove datatype annotations  "literal"^^type
+    if "^^" in value:
+        value = value.split("^^")[0]
+    # Strip surrounding quotes
+    value = value.strip('"\'')
+    # Replace whitespace with underscore
+    value = re.sub(r"\s+", "_", value)
+    return value if value else "unknown"
+
+
+def _node_label(node: Any) -> str:
+    """Convert rdflib node to clean string label."""
+    if isinstance(node, Literal):
+        raw = str(node)
+        return re.sub(r"\s+", "_", raw.strip())
+    if isinstance(node, (URIRef, BNode)):
+        return _clean_uri(str(node))
+    return _clean_uri(str(node))
+
+
+# ── CSV ─────────────────────────────────────────────────────────────────────
+
+def _load_csv(
+    source: Union[str, Path, io.StringIO],
+    subject_col:   str = "subject",
+    predicate_col: str = "predicate",
+    object_col:    str = "object",
+) -> Tuple[List[KGTriple], Dict[str, Any]]:
+    """
+    Load KG triples from a CSV file or StringIO buffer.
+
+    Expected columns (configurable):
+        subject | predicate | object
+        --------+-----------+-------
+        SupplierA | supplies | ComponentX
+
+    Optional extra columns are collected as metadata.
+    The function is tolerant of:
+      - Missing headers  (falls back to positional columns 0,1,2)
+      - Extra whitespace in cells
+      - BOM characters
+    """
+    if isinstance(source, (str, Path)):
+        df = pd.read_csv(source, encoding="utf-8-sig", skipinitialspace=True)
+    else:
+        df = pd.read_csv(source, encoding="utf-8-sig", skipinitialspace=True)
+
+    # Normalise column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Map expected column names to actual
+    col_aliases = {
+        "subject":   ["subject", "s", "src", "source", "from"],
+        "predicate": ["predicate", "p", "relation", "rel", "edge", "property"],
+        "object":    ["object", "o", "obj", "target", "dst", "to", "value"],
+    }
+
+    def resolve(aliases: List[str], fallback_idx: int) -> str:
+        for alias in aliases:
+            if alias in df.columns:
+                return alias
+        if fallback_idx < len(df.columns):
+            return df.columns[fallback_idx]
+        raise ValueError(
+            f"Cannot find a column matching any of {aliases} in CSV. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    s_col = resolve(col_aliases["subject"],   0)
+    p_col = resolve(col_aliases["predicate"], 1)
+    o_col = resolve(col_aliases["object"],    2)
+
+    # Extra columns → metadata list
+    extra_cols = [c for c in df.columns if c not in (s_col, p_col, o_col)]
+    metadata: Dict[str, Any] = {}
+    if extra_cols:
+        metadata["csv_extra_columns"] = extra_cols
+        metadata["csv_rows"] = len(df)
+        for col in extra_cols:
+            metadata[col] = df[col].dropna().unique().tolist()
+
+    triples: List[KGTriple] = []
+    for _, row in df.iterrows():
+        s = _clean_uri(str(row[s_col]))
+        p = _clean_uri(str(row[p_col]))
+        o = _clean_uri(str(row[o_col]))
+        if s and p and o and s != "nan":
+            triples.append(KGTriple(s, p, o))
+
+    console.print(
+        f"[green]CSV loaded:[/green] {len(triples)} triples "
+        f"from columns [{s_col}, {p_col}, {o_col}]"
+    )
+    return triples, metadata
+
+
+# ── RDF FORMATS (TTL / N-Triples / JSON-LD / RDF-XML) ───────────────────────
+
+def _load_rdf(
+    source: Union[str, Path],
+    fmt: KGFileFormat,
+    max_triples: int = 5000,
+    exclude_rdf_schema: bool = True,
+) -> Tuple[List[KGTriple], Dict[str, Any]]:
+    """
+    Load KG triples from any RDF serialisation supported by rdflib:
+      - Turtle (.ttl)
+      - N-Triples (.nt)
+      - JSON-LD (.jsonld)
+      - RDF/XML (.xml / .rdf / .owl)
+
+    Parameters
+    ----------
+    source : file path
+    fmt    : KGFileFormat enum
+    max_triples : cap to avoid OOM on huge ontologies
+    exclude_rdf_schema : skip RDF/RDFS/OWL schema triples (type, subClassOf, …)
+                         to keep the KG focused on instance data
+    """
+    if not RDFLIB_AVAILABLE:
+        raise ImportError(
+            "rdflib is required for RDF ingestion. "
+            "Install: pip install rdflib"
+        )
+
+    rdflib_format_map = {
+        KGFileFormat.TURTLE:   "turtle",
+        KGFileFormat.NTRIPLES: "nt",
+        KGFileFormat.JSONLD:   "json-ld",
+        KGFileFormat.RDFXML:   "xml",
+    }
+    rdf_fmt = rdflib_format_map.get(fmt, "turtle")
+
+    g = RDFGraph()
+    g.parse(str(source), format=rdf_fmt)
+    console.print(f"[green]RDF parsed:[/green] {len(g)} raw triples ({rdf_fmt})")
+
+    # Schema predicates to skip when exclude_rdf_schema=True
+    schema_predicates = {
+        str(RDF.type), str(RDFS.subClassOf), str(RDFS.domain),
+        str(RDFS.range), str(RDFS.label), str(RDFS.comment),
+        str(OWL.equivalentClass), str(OWL.disjointWith),
+    } if exclude_rdf_schema else set()
+
+    triples: List[KGTriple] = []
+    for s, p, o in g:
+        if str(p) in schema_predicates:
+            continue
+        subject   = _node_label(s)
+        predicate = _node_label(p)
+        obj       = _node_label(o)
+        if subject and predicate and obj:
+            triples.append(KGTriple(subject, predicate, obj))
+        if len(triples) >= max_triples:
+            console.print(
+                f"[yellow]Warning:[/yellow] max_triples={max_triples} reached — "
+                "truncating. Pass a higher max_triples if needed."
+            )
+            break
+
+    metadata: Dict[str, Any] = {
+        "rdf_format":       rdf_fmt,
+        "raw_triple_count": len(g),
+        "loaded_triples":   len(triples),
+        "namespaces":       {p: str(n) for p, n in g.namespaces()},
+    }
+    console.print(f"[green]RDF loaded:[/green] {len(triples)} instance triples retained")
+    return triples, metadata
+
+
+# ── JSON (plain / custom schema) ─────────────────────────────────────────────
+
+def _load_json(
+    source: Union[str, Path, dict],
+    triple_key: str = "triples",
+) -> Tuple[List[KGTriple], Dict[str, Any]]:
+    """
+    Load triples from a plain JSON file.
+
+    Supported schemas:
+      A) {"triples": [{"s": "...", "p": "...", "o": "..."}, ...]}
+      B) {"triples": [{"subject": "...", "predicate": "...", "object": "..."}, ...]}
+      C) {"entities": [...], "relations": [...]}  (graph export format)
+      D) Flat list of triple dicts at top level
+
+    If the file looks like JSON-LD (has "@context"), route to rdflib instead.
+    """
+    if isinstance(source, dict):
+        data = source
+    else:
+        with open(source, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    # Route to rdflib if this is JSON-LD
+    if isinstance(data, dict) and "@context" in data:
+        console.print("[dim]JSON-LD detected — routing to rdflib parser[/dim]")
+        return _load_rdf(source, KGFileFormat.JSONLD)
+
+    triples: List[KGTriple] = []
+
+    # Schema A/B: top-level "triples" key
+    raw_list: Optional[List[dict]] = None
+    if isinstance(data, dict) and triple_key in data:
+        raw_list = data[triple_key]
+    elif isinstance(data, list):
+        raw_list = data
+    # Schema C: graph export with "entities"/"relations" keys
+    elif isinstance(data, dict) and "relations" in data:
+        raw_list = data["relations"]
+
+    if raw_list is None:
+        raise ValueError(
+            f"Cannot interpret JSON structure. "
+            f"Expected a list or a dict with key '{triple_key}'. "
+            f"Top-level keys found: {list(data.keys()) if isinstance(data, dict) else 'list'}"
+        )
+
+    s_aliases = ["s", "subject", "src",  "source", "from", "head"]
+    p_aliases = ["p", "predicate", "rel", "relation", "edge", "type"]
+    o_aliases = ["o", "object",  "obj",  "target",  "dst",  "to",  "tail", "value"]
+
+    def pick(d: dict, aliases: List[str]) -> str:
+        for a in aliases:
+            if a in d:
+                return str(d[a])
+        return ""
+
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        s = _clean_uri(pick(item, s_aliases))
+        p = _clean_uri(pick(item, p_aliases))
+        o = _clean_uri(pick(item, o_aliases))
+        if s and p and o:
+            triples.append(KGTriple(s, p, o))
+
+    # Collect remaining top-level keys as metadata
+    metadata: Dict[str, Any] = {
+        k: v for k, v in (data.items() if isinstance(data, dict) else {}.items())
+        if k not in (triple_key, "relations", "entities", "@context", "@graph")
+        and not isinstance(v, (list, dict))
+    }
+    console.print(f"[green]JSON loaded:[/green] {len(triples)} triples")
+    return triples, metadata
+
+
+# ── MAIN PUBLIC API ─────────────────────────────────────────────────────────
+
+def load_kg_from_file(
+    filepath:             Union[str, Path],
+    fmt:                  KGFileFormat = KGFileFormat.AUTO,
+    task_type:            TaskType     = TaskType.SUPPLY_CHAIN_IMPACT,
+    observation:          str          = "",
+    constraints:          Optional[List[str]] = None,
+    extra_metadata:       Optional[Dict[str, Any]] = None,
+    # CSV-specific
+    csv_subject_col:      str = "subject",
+    csv_predicate_col:    str = "predicate",
+    csv_object_col:       str = "object",
+    # RDF-specific
+    rdf_max_triples:      int  = 5000,
+    rdf_exclude_schema:   bool = True,
+) -> EnterpriseContext:
+    """
+    Universal entry point: load a KG from any supported file format and return
+    a ready-to-use EnterpriseContext for the JEPA-KG world model.
+
+    Parameters
+    ----------
+    filepath          : path to the data file
+    fmt               : KGFileFormat enum (AUTO = detect from extension)
+    task_type         : which enterprise task this context belongs to
+    observation       : human-readable description of the situation
+    constraints       : list of business/regulatory constraints
+    extra_metadata    : additional metadata dict to merge
+    csv_subject_col   : CSV column name for subject  (default "subject")
+    csv_predicate_col : CSV column name for predicate (default "predicate")
+    csv_object_col    : CSV column name for object   (default "object")
+    rdf_max_triples   : max triples to load from RDF (avoids OOM)
+    rdf_exclude_schema: skip RDF/OWL schema triples
+
+    Returns
+    -------
+    EnterpriseContext ready for serialization and inference.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    # Auto-detect format
+    if fmt == KGFileFormat.AUTO:
+        ext = path.suffix.lower()
+        fmt = _EXT_MAP.get(ext)
+        if fmt is None:
+            raise ValueError(
+                f"Cannot auto-detect format from extension '{ext}'. "
+                f"Supported: {list(_EXT_MAP.keys())}. "
+                "Pass fmt= explicitly."
+            )
+        console.print(f"[dim]Auto-detected format: {fmt.value}[/dim]")
+
+    # Dispatch
+    if fmt == KGFileFormat.CSV:
+        triples, file_meta = _load_csv(
+            path,
+            subject_col=csv_subject_col,
+            predicate_col=csv_predicate_col,
+            object_col=csv_object_col,
+        )
+    elif fmt in (KGFileFormat.TURTLE, KGFileFormat.NTRIPLES,
+                 KGFileFormat.RDFXML, KGFileFormat.JSONLD):
+        triples, file_meta = _load_rdf(path, fmt, rdf_max_triples, rdf_exclude_schema)
+    elif fmt == KGFileFormat.JSON:
+        triples, file_meta = _load_json(path)
+    else:
+        raise ValueError(f"Unsupported format: {fmt}")
+
+    # Validate
+    if not triples:
+        raise ValueError(f"No valid triples extracted from {filepath}. "
+                         "Check column names / file structure.")
+
+    # Auto-generate observation if not provided
+    if not observation:
+        observation = (
+            f"Enterprise Knowledge Graph loaded from {path.name}. "
+            f"{len(triples)} triples ingested covering "
+            f"{len({t.subject for t in triples})} entities."
+        )
+
+    # Merge metadata
+    metadata: Dict[str, Any] = {
+        "source_file": str(path),
+        "file_format": fmt.value,
+        "triple_count": len(triples),
+    }
+    metadata.update(file_meta)
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    ctx = EnterpriseContext(
+        task_type=task_type,
+        triples=triples,
+        observation=observation,
+        constraints=constraints or [],
+        metadata=metadata,
+    )
+    console.print(
+        f"[bold green]EnterpriseContext built:[/bold green] "
+        f"{len(triples)} triples | task={task_type.value}"
+    )
+    return ctx
+
+
+def load_kg_from_string(
+    content:    str,
+    fmt:        KGFileFormat,
+    task_type:  TaskType = TaskType.SUPPLY_CHAIN_IMPACT,
+    observation: str = "",
+    constraints: Optional[List[str]] = None,
+) -> EnterpriseContext:
+    """
+    Load a KG directly from a string (CSV text, Turtle text, or JSON text).
+    Useful for in-memory / API scenarios.
+    """
+    if fmt == KGFileFormat.CSV:
+        buf = io.StringIO(content)
+        triples, file_meta = _load_csv(buf)
+    elif fmt == KGFileFormat.JSON:
+        data = json.loads(content)
+        triples, file_meta = _load_json(data)
+    elif fmt in (KGFileFormat.TURTLE, KGFileFormat.NTRIPLES,
+                 KGFileFormat.RDFXML, KGFileFormat.JSONLD):
+        if not RDFLIB_AVAILABLE:
+            raise ImportError("rdflib required for RDF string parsing. pip install rdflib")
+        rdflib_fmt_map = {
+            KGFileFormat.TURTLE:   "turtle",
+            KGFileFormat.NTRIPLES: "nt",
+            KGFileFormat.JSONLD:   "json-ld",
+            KGFileFormat.RDFXML:   "xml",
+        }
+        g = RDFGraph()
+        g.parse(data=content, format=rdflib_fmt_map[fmt])
+        triples = [
+            KGTriple(_node_label(s), _node_label(p), _node_label(o))
+            for s, p, o in g
+        ]
+        file_meta = {"raw_triple_count": len(g)}
+    else:
+        raise ValueError(f"Unsupported format for string loading: {fmt}")
+
+    if not observation:
+        observation = (
+            f"Knowledge Graph loaded from in-memory string. "
+            f"{len(triples)} triples."
+        )
+
+    return EnterpriseContext(
+        task_type=task_type,
+        triples=triples,
+        observation=observation,
+        constraints=constraints or [],
+        metadata={**file_meta, "source": "in-memory-string", "format": fmt.value},
+    )
+
+
+def export_triples_to_csv(ctx: EnterpriseContext, output_path: Union[str, Path]) -> None:
+    """Export triples from an EnterpriseContext back to CSV."""
+    path = Path(output_path)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["subject", "predicate", "object"])
+        for t in ctx.triples:
+            writer.writerow([t.subject, t.predicate, t.obj])
+    console.print(f"[green]Exported {len(ctx.triples)} triples → {path}[/green]")
+
+
+def export_triples_to_ttl(ctx: EnterpriseContext, output_path: Union[str, Path]) -> None:
+    """Export triples from an EnterpriseContext to Turtle (.ttl) format."""
+    if not RDFLIB_AVAILABLE:
+        raise ImportError("rdflib required for TTL export. pip install rdflib")
+    path = Path(output_path)
+    base = "http://enterprise-world-model.org/kg/"
+    g = RDFGraph()
+    g.bind("ewm", base)
+    for t in ctx.triples:
+        s = URIRef(f"{base}{t.subject.replace(' ', '_')}")
+        p = URIRef(f"{base}{t.predicate.replace(' ', '_')}")
+        o = URIRef(f"{base}{t.obj.replace(' ', '_')}")
+        g.add((s, p, o))
+    g.serialize(destination=str(path), format="turtle")
+    console.print(f"[green]Exported {len(ctx.triples)} triples → {path} (Turtle)[/green]")
+
+
+# ---------------------------------------------------------------------------
+# 5. PREDEFINED ENTERPRISE SCENARIOS (unchanged from original)
+# ---------------------------------------------------------------------------
+
+SCENARIOS: Dict[TaskType, EnterpriseContext] = {
+
     TaskType.SUPPLY_CHAIN_IMPACT: EnterpriseContext(
         task_type=TaskType.SUPPLY_CHAIN_IMPACT,
         triples=[
@@ -138,7 +640,6 @@ SCENARIOS: dict[TaskType, EnterpriseContext] = {
         metadata={"domain": "automotive", "plant": "Stuttgart", "urgency": "critical"},
     ),
 
-    # -----------------------------------------------------------------------
     TaskType.COMPLIANCE_INFERENCE: EnterpriseContext(
         task_type=TaskType.COMPLIANCE_INFERENCE,
         triples=[
@@ -164,22 +665,21 @@ SCENARIOS: dict[TaskType, EnterpriseContext] = {
         metadata={"domain": "life_sciences", "product_type": "medical_device"},
     ),
 
-    # -----------------------------------------------------------------------
     TaskType.PROCESS_VIOLATION: EnterpriseContext(
         task_type=TaskType.PROCESS_VIOLATION,
         triples=[
-            KGTriple("Process_LoanApproval",   "step_1",        "KYC_Identity_Verification"),
-            KGTriple("Process_LoanApproval",   "step_2",        "Credit_Score_Check"),
-            KGTriple("Process_LoanApproval",   "step_3",        "Affordability_Assessment"),
-            KGTriple("Process_LoanApproval",   "step_4",        "Risk_Scoring"),
-            KGTriple("Process_LoanApproval",   "step_5",        "Approval_Decision"),
-            KGTriple("KYC_Identity_Verification", "SLA",        "24h"),
-            KGTriple("Credit_Score_Check",     "externalAPI",   "Experian_API"),
-            KGTriple("Experian_API",           "availability",  "94_percent"),
-            KGTriple("Affordability_Assessment", "requires",    "Income_Verification_Doc"),
-            KGTriple("Risk_Scoring",           "model",         "ML_Model_v3_2"),
-            KGTriple("ML_Model_v3_2",          "drift_status",  "high_drift_detected"),
-            KGTriple("Process_LoanApproval",   "volume_today",  "4200_applications"),
+            KGTriple("Process_LoanApproval",      "step_1",       "KYC_Identity_Verification"),
+            KGTriple("Process_LoanApproval",      "step_2",       "Credit_Score_Check"),
+            KGTriple("Process_LoanApproval",      "step_3",       "Affordability_Assessment"),
+            KGTriple("Process_LoanApproval",      "step_4",       "Risk_Scoring"),
+            KGTriple("Process_LoanApproval",      "step_5",       "Approval_Decision"),
+            KGTriple("KYC_Identity_Verification", "SLA",          "24h"),
+            KGTriple("Credit_Score_Check",        "externalAPI",  "Experian_API"),
+            KGTriple("Experian_API",              "availability", "94_percent"),
+            KGTriple("Affordability_Assessment",  "requires",     "Income_Verification_Doc"),
+            KGTriple("Risk_Scoring",              "model",        "ML_Model_v3_2"),
+            KGTriple("ML_Model_v3_2",             "drift_status", "high_drift_detected"),
+            KGTriple("Process_LoanApproval",      "volume_today", "4200_applications"),
         ],
         observation=(
             "Loan approval process running at 4,200 applications today. "
@@ -196,21 +696,20 @@ SCENARIOS: dict[TaskType, EnterpriseContext] = {
         metadata={"domain": "financial_services", "process": "loan_origination"},
     ),
 
-    # -----------------------------------------------------------------------
     TaskType.DATA_QUALITY_PREDICTION: EnterpriseContext(
         task_type=TaskType.DATA_QUALITY_PREDICTION,
         triples=[
-            KGTriple("Pipeline_CRM_to_DWH",    "source",        "Salesforce_CRM"),
-            KGTriple("Pipeline_CRM_to_DWH",    "target",        "Snowflake_DWH"),
-            KGTriple("Pipeline_CRM_to_DWH",    "schedule",      "daily_02:00_UTC"),
-            KGTriple("Salesforce_CRM",         "recentChange",  "Custom_Field_Migration_v4"),
-            KGTriple("Custom_Field_Migration_v4", "status",     "completed_yesterday"),
-            KGTriple("Pipeline_CRM_to_DWH",    "lastRun",       "success_3_days_ago"),
-            KGTriple("Snowflake_DWH",          "downstream",    "Revenue_Dashboard"),
-            KGTriple("Revenue_Dashboard",      "usedBy",        "CFO_Board_Report"),
-            KGTriple("CFO_Board_Report",       "scheduledAt",   "tomorrow_09:00"),
-            KGTriple("Field_AccountRevenue",   "mappingStatus", "unmapped_after_migration"),
-            KGTriple("Field_OpportunityStage", "valueSet",      "changed_in_migration"),
+            KGTriple("Pipeline_CRM_to_DWH",       "source",        "Salesforce_CRM"),
+            KGTriple("Pipeline_CRM_to_DWH",       "target",        "Snowflake_DWH"),
+            KGTriple("Pipeline_CRM_to_DWH",       "schedule",      "daily_02:00_UTC"),
+            KGTriple("Salesforce_CRM",            "recentChange",  "Custom_Field_Migration_v4"),
+            KGTriple("Custom_Field_Migration_v4", "status",        "completed_yesterday"),
+            KGTriple("Pipeline_CRM_to_DWH",       "lastRun",       "success_3_days_ago"),
+            KGTriple("Snowflake_DWH",             "downstream",    "Revenue_Dashboard"),
+            KGTriple("Revenue_Dashboard",         "usedBy",        "CFO_Board_Report"),
+            KGTriple("CFO_Board_Report",          "scheduledAt",   "tomorrow_09:00"),
+            KGTriple("Field_AccountRevenue",      "mappingStatus", "unmapped_after_migration"),
+            KGTriple("Field_OpportunityStage",    "valueSet",      "changed_in_migration"),
         ],
         observation=(
             "CRM pipeline runs nightly. A custom field migration was completed yesterday. "
@@ -225,21 +724,20 @@ SCENARIOS: dict[TaskType, EnterpriseContext] = {
         metadata={"domain": "data_engineering", "criticality": "board_level"},
     ),
 
-    # -----------------------------------------------------------------------
     TaskType.BUSINESS_SIMULATION: EnterpriseContext(
         task_type=TaskType.BUSINESS_SIMULATION,
         triples=[
-            KGTriple("Supplier_ChemCo_A",      "supplies",      "Solvent_X22"),
-            KGTriple("Solvent_X22",            "usedIn",        "Manufacturing_Process_P3"),
-            KGTriple("Solvent_X22",            "REACHStatus",   "SVHC_Candidate"),
-            KGTriple("Supplier_ChemCo_A",      "contractValue", "EUR_2.4M_annual"),
-            KGTriple("Supplier_GreenChem_B",   "offers",        "BioSolvent_Y11"),
-            KGTriple("BioSolvent_Y11",         "REACHStatus",   "fully_compliant"),
-            KGTriple("BioSolvent_Y11",         "pricePremium",  "18_percent"),
-            KGTriple("BioSolvent_Y11",         "qualStatus",    "not_yet_qualified"),
-            KGTriple("Manufacturing_Process_P3", "output",      "Product_Line_Pharma_API"),
-            KGTriple("Product_Line_Pharma_API", "annualRevenue","EUR_28M"),
-            KGTriple("EU_REACH_Restriction",   "effectiveDate", "2026_Q3"),
+            KGTriple("Supplier_ChemCo_A",       "supplies",      "Solvent_X22"),
+            KGTriple("Solvent_X22",             "usedIn",        "Manufacturing_Process_P3"),
+            KGTriple("Solvent_X22",             "REACHStatus",   "SVHC_Candidate"),
+            KGTriple("Supplier_ChemCo_A",       "contractValue", "EUR_2.4M_annual"),
+            KGTriple("Supplier_GreenChem_B",    "offers",        "BioSolvent_Y11"),
+            KGTriple("BioSolvent_Y11",          "REACHStatus",   "fully_compliant"),
+            KGTriple("BioSolvent_Y11",          "pricePremium",  "18_percent"),
+            KGTriple("BioSolvent_Y11",          "qualStatus",    "not_yet_qualified"),
+            KGTriple("Manufacturing_Process_P3","output",        "Product_Line_Pharma_API"),
+            KGTriple("Product_Line_Pharma_API", "annualRevenue", "EUR_28M"),
+            KGTriple("EU_REACH_Restriction",    "effectiveDate", "2026_Q3"),
         ],
         observation=(
             "Current supplier ChemCo A provides Solvent X22, which is on the SVHC candidate list. "
@@ -258,10 +756,10 @@ SCENARIOS: dict[TaskType, EnterpriseContext] = {
 
 
 # ---------------------------------------------------------------------------
-# 5. SYSTEM PROMPTS PER TASK
+# 6. SYSTEM PROMPTS PER TASK
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPTS: dict[TaskType, str] = {
+SYSTEM_PROMPTS: Dict[TaskType, str] = {
 
     TaskType.SUPPLY_CHAIN_IMPACT: textwrap.dedent("""
         You are an Enterprise World Model specialising in supply chain risk intelligence.
@@ -335,7 +833,7 @@ SYSTEM_PROMPTS: dict[TaskType, str] = {
 
 
 # ---------------------------------------------------------------------------
-# 6. MODEL INITIALISATION
+# 7. MODEL INITIALISATION
 # ---------------------------------------------------------------------------
 
 def initialize_world_model(model_name: str = "google/gemma-2-2b-it"):
@@ -371,7 +869,7 @@ def initialize_world_model(model_name: str = "google/gemma-2-2b-it"):
 
 
 # ---------------------------------------------------------------------------
-# 7. DATA COLLATOR — ENTERPRISE MULTI-TASK
+# 8. DATA COLLATOR — ENTERPRISE MULTI-TASK
 # ---------------------------------------------------------------------------
 
 class EnterpriseWorldModelDataCollator:
@@ -387,12 +885,12 @@ class EnterpriseWorldModelDataCollator:
     """
 
     def __init__(self, tokenizer, max_length: int = 256):
-        self.tokenizer = tokenizer
+        self.tokenizer  = tokenizer
         self.max_length = max_length
 
     def encode_sample(self, context: EnterpriseContext, target: str) -> dict:
         full_text = f"{context.serialize()} {MODALITY_TOKENS['impact']} {target}"
-        encoding = self.tokenizer(
+        encoding  = self.tokenizer(
             full_text,
             return_tensors="pt",
             padding="max_length",
@@ -400,16 +898,15 @@ class EnterpriseWorldModelDataCollator:
             truncation=True,
         )
 
-        # Locate boundary tokens for JEPA loss
         context_text = context.serialize()
-        context_enc = self.tokenizer(
+        context_enc  = self.tokenizer(
             context_text,
             return_tensors="pt",
             truncation=True,
             max_length=self.max_length,
         )
         context_len = min(context_enc["input_ids"].shape[1] - 1, self.max_length - 2)
-        target_len  = min(encoding["input_ids"].shape[1] - 1,   self.max_length - 2)
+        target_len  = min(encoding["input_ids"].shape[1]   - 1, self.max_length - 2)
 
         return {
             "input_ids":       encoding["input_ids"].squeeze(0),
@@ -418,7 +915,7 @@ class EnterpriseWorldModelDataCollator:
             "target_end_idx":  target_len,
         }
 
-    def __call__(self, examples: list[dict]) -> dict:
+    def __call__(self, examples: List[dict]) -> dict:
         input_ids      = torch.stack([ex["input_ids"]      for ex in examples])
         attention_mask = torch.stack([ex["attention_mask"] for ex in examples])
         context_ends   = [ex["context_end_idx"] for ex in examples]
@@ -433,14 +930,14 @@ class EnterpriseWorldModelDataCollator:
 
 
 # ---------------------------------------------------------------------------
-# 8. JEPA-KG TRAINER
+# 9. JEPA-KG TRAINER
 # ---------------------------------------------------------------------------
 
 class JEPAKGTrainer(Trainer):
     """
     Dual-objective trainer:
 
-      Loss = λ_lm  * CrossEntropy(token prediction)
+      Loss = λ_lm   * CrossEntropy(token prediction)
            + λ_jepa * (1 - cosine_similarity(z_context, z_target))
 
     The JEPA branch forces the model to align its latent representation of
@@ -454,9 +951,9 @@ class JEPAKGTrainer(Trainer):
         self.jepa_weight = jepa_weight
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels         = inputs.pop("labels")
-        context_ends   = inputs.pop("context_end_idx")
-        target_ends    = inputs.pop("target_end_idx")
+        labels       = inputs.pop("labels")
+        context_ends = inputs.pop("context_end_idx")
+        target_ends  = inputs.pop("target_end_idx")
 
         outputs = model(
             **inputs,
@@ -465,29 +962,32 @@ class JEPAKGTrainer(Trainer):
         )
 
         lm_loss = outputs.loss
-        hidden  = outputs.hidden_states[-1]  # (batch, seq_len, hidden_dim)
+        hidden  = outputs.hidden_states[-1]   # (batch, seq_len, hidden_dim)
 
-        # Safely clamp indices
         B = hidden.shape[0]
         jepa_losses = []
         for i in range(B):
-            c_idx = min(context_ends[i] if isinstance(context_ends, list)
-                        else context_ends, hidden.shape[1] - 1)
-            t_idx = min(target_ends[i]  if isinstance(target_ends,  list)
-                        else target_ends,  hidden.shape[1] - 1)
-            z_ctx = hidden[i, c_idx, :]   # latent of enterprise context state
-            z_tgt = hidden[i, t_idx, :]   # latent of enterprise outcome state
+            c_idx = min(
+                context_ends[i] if isinstance(context_ends, list) else int(context_ends),
+                hidden.shape[1] - 1,
+            )
+            t_idx = min(
+                target_ends[i]  if isinstance(target_ends,  list) else int(target_ends),
+                hidden.shape[1] - 1,
+            )
+            z_ctx = hidden[i, c_idx, :]
+            z_tgt = hidden[i, t_idx, :]
             sim   = F.cosine_similarity(z_ctx.unsqueeze(0), z_tgt.unsqueeze(0))
             jepa_losses.append(1.0 - sim)
 
-        jepa_loss = torch.stack(jepa_losses).mean()
+        jepa_loss  = torch.stack(jepa_losses).mean()
         total_loss = lm_loss + self.jepa_weight * jepa_loss
 
         return (total_loss, outputs) if return_outputs else total_loss
 
 
 # ---------------------------------------------------------------------------
-# 9. INFERENCE ENGINE
+# 10. INFERENCE ENGINE
 # ---------------------------------------------------------------------------
 
 class EnterpriseWorldModelInference:
@@ -536,21 +1036,24 @@ class EnterpriseWorldModelInference:
 
 
 # ---------------------------------------------------------------------------
-# 10. TRAINING PIPELINE
+# 11. TRAINING PIPELINE
 # ---------------------------------------------------------------------------
 
 def build_training_dataset(
     tokenizer,
     max_length: int = 256,
-) -> tuple[list[dict], EnterpriseWorldModelDataCollator]:
+) -> Tuple[List[dict], EnterpriseWorldModelDataCollator]:
     """
     Build a minimal multi-task training dataset from the five scenario templates.
     In production, replace ground-truth targets with real enterprise outcomes
     extracted from Corporate Memory / historical KG snapshots.
+
+    You can also build datasets from external files:
+        ctx = load_kg_from_file("supply_chain.ttl", task_type=TaskType.SUPPLY_CHAIN_IMPACT)
+        sample = collator.encode_sample(ctx, ground_truth_text)
     """
 
-    # Ground-truth targets (would come from historical enterprise data in production)
-    ground_truths: dict[TaskType, str] = {
+    ground_truths: Dict[TaskType, str] = {
 
         TaskType.SUPPLY_CHAIN_IMPACT: (
             "IMPACT CHAIN: MCU-X7 stockout at Day 3 → ECU Module B production halt → "
@@ -615,8 +1118,8 @@ def build_training_dataset(
     collator = EnterpriseWorldModelDataCollator(tokenizer, max_length=max_length)
     dataset  = []
     for task_type, context in SCENARIOS.items():
-        target  = ground_truths[task_type]
-        sample  = collator.encode_sample(context, target)
+        target = ground_truths[task_type]
+        sample = collator.encode_sample(context, target)
         dataset.append(sample)
 
     return dataset, collator
@@ -658,7 +1161,7 @@ def run_training(model, tokenizer, output_dir: str = "./jepa_kg_world_model"):
 
 
 # ---------------------------------------------------------------------------
-# 11. DEMO RUNNER — ALL FIVE ENTERPRISE TASKS
+# 12. DEMO RUNNER — ALL FIVE ENTERPRISE TASKS
 # ---------------------------------------------------------------------------
 
 def run_demo(model, tokenizer):
@@ -678,7 +1181,7 @@ def run_demo(model, tokenizer):
     }
 
     table = Table(title="Enterprise World Model — Task Overview", style="bold")
-    table.add_column("Task", style="cyan")
+    table.add_column("Task",     style="cyan")
     table.add_column("Scenario", style="white")
     for task, label in task_labels.items():
         scenario = SCENARIOS[task]
@@ -710,7 +1213,125 @@ def run_demo(model, tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# 12. ENTRY POINT
+# 13. FILE-BASED DEMO  (NEW)
+# ---------------------------------------------------------------------------
+
+def run_file_demo():
+    """
+    Demonstrate the data processing layer by creating small example files
+    in each supported format, loading them as EnterpriseContext objects,
+    and printing the serialized result — WITHOUT requiring a GPU or model.
+    """
+    console.print(Panel(
+        "[bold magenta]Data Processing Demo — Multi-Format KG Ingestion[/bold magenta]\n"
+        "Demonstrates CSV, JSON, TTL, and N-Triples loading.",
+        border_style="magenta",
+    ))
+
+    # ── 1. CSV example ─────────────────────────────────────────────────────
+    csv_content = textwrap.dedent("""\
+        subject,predicate,object,domain
+        Supplier_Alpha,supplies,Chip_XZ9,electronics
+        Chip_XZ9,usedIn,PCB_Module_A,electronics
+        PCB_Module_A,partOf,Server_Platform_Q,datacentre
+        Supplier_Alpha,delayedBy,4_weeks,logistics
+        Chip_XZ9,stockLevel,2_days_supply,inventory
+    """)
+    csv_path = Path("/tmp/demo_supply_chain.csv")
+    csv_path.write_text(csv_content, encoding="utf-8")
+
+    ctx_csv = load_kg_from_file(
+        csv_path,
+        task_type=TaskType.SUPPLY_CHAIN_IMPACT,
+        observation="Supplier Alpha reports a 4-week delay on Chip XZ9.",
+        constraints=["JIT policy: max 3-day buffer", "Penalty clause: $80k/day"],
+    )
+    console.print("[bold]CSV Context serialized:[/bold]")
+    console.print(ctx_csv.serialize()[:300] + " …\n")
+
+    # ── 2. JSON example ────────────────────────────────────────────────────
+    json_content = json.dumps({
+        "domain": "financial_services",
+        "triples": [
+            {"s": "Process_CreditApproval", "p": "step_1", "o": "KYC_Check"},
+            {"s": "Process_CreditApproval", "p": "step_2", "o": "Score_Model"},
+            {"s": "Score_Model",            "p": "drift_status", "o": "high"},
+            {"s": "KYC_Check",              "p": "SLA",          "o": "24h"},
+        ],
+    }, indent=2)
+    json_path = Path("/tmp/demo_process.json")
+    json_path.write_text(json_content, encoding="utf-8")
+
+    ctx_json = load_kg_from_file(
+        json_path,
+        task_type=TaskType.PROCESS_VIOLATION,
+        observation="Credit approval process with drifted scoring model.",
+        constraints=["FCA 72h rule", "GDPR explainability"],
+    )
+    console.print("[bold]JSON Context serialized:[/bold]")
+    console.print(ctx_json.serialize()[:300] + " …\n")
+
+    # ── 3. Turtle (TTL) example ────────────────────────────────────────────
+    if RDFLIB_AVAILABLE:
+        ttl_content = textwrap.dedent("""\
+            @prefix ewm: <http://enterprise-world-model.org/kg/> .
+
+            ewm:Supplier_GreenChem   ewm:supplies        ewm:BioSolvent_Y11 .
+            ewm:BioSolvent_Y11       ewm:REACHStatus     ewm:fully_compliant .
+            ewm:BioSolvent_Y11       ewm:pricePremium    ewm:18_percent .
+            ewm:Manufacturing_P3     ewm:uses            ewm:Solvent_X22 .
+            ewm:Solvent_X22          ewm:REACHStatus     ewm:SVHC_Candidate .
+            ewm:EU_REACH_Restriction ewm:effectiveDate   ewm:2026_Q3 .
+        """)
+        ttl_path = Path("/tmp/demo_simulation.ttl")
+        ttl_path.write_text(ttl_content, encoding="utf-8")
+
+        ctx_ttl = load_kg_from_file(
+            ttl_path,
+            task_type=TaskType.BUSINESS_SIMULATION,
+            observation="REACH restriction incoming. Evaluating BioSolvent Y11 switch.",
+            constraints=["REACH SVHC deadline Q3 2026", "GMP revalidation 12-18 months"],
+        )
+        console.print("[bold]TTL Context serialized:[/bold]")
+        console.print(ctx_ttl.serialize()[:300] + " …\n")
+
+        # ── 4. N-Triples example ───────────────────────────────────────────
+        nt_content = textwrap.dedent("""\
+            <http://ewm.org/Pipeline_CRM_DWH> <http://ewm.org/source> <http://ewm.org/Salesforce_CRM> .
+            <http://ewm.org/Pipeline_CRM_DWH> <http://ewm.org/target> <http://ewm.org/Snowflake_DWH> .
+            <http://ewm.org/Salesforce_CRM>   <http://ewm.org/recentChange> <http://ewm.org/Field_Migration_v4> .
+            <http://ewm.org/Field_Migration_v4> <http://ewm.org/status> <http://ewm.org/completed_yesterday> .
+            <http://ewm.org/Field_AccountRevenue> <http://ewm.org/mappingStatus> <http://ewm.org/unmapped> .
+        """)
+        nt_path = Path("/tmp/demo_data_quality.nt")
+        nt_path.write_text(nt_content, encoding="utf-8")
+
+        ctx_nt = load_kg_from_file(
+            nt_path,
+            task_type=TaskType.DATA_QUALITY_PREDICTION,
+            observation="CRM→DWH pipeline post-migration. AccountRevenue field unmapped.",
+            constraints=["DWH SLA: fresh by 06:00 UTC", "Board report zero-tolerance"],
+        )
+        console.print("[bold]N-Triples Context serialized:[/bold]")
+        console.print(ctx_nt.serialize()[:300] + " …\n")
+
+    else:
+        console.print("[yellow]rdflib not installed — skipping TTL and N-Triples demo.[/yellow]")
+
+    # ── Export round-trip ──────────────────────────────────────────────────
+    export_triples_to_csv(ctx_csv, "/tmp/demo_export_roundtrip.csv")
+    if RDFLIB_AVAILABLE:
+        export_triples_to_ttl(ctx_csv, "/tmp/demo_export_roundtrip.ttl")
+
+    console.print(Panel(
+        "[green]Data processing demo complete.[/green]\n"
+        "All EnterpriseContext objects are ready for model inference or training.",
+        border_style="green",
+    ))
+
+
+# ---------------------------------------------------------------------------
+# 14. ENTRY POINT
 # ---------------------------------------------------------------------------
 
 def main():
@@ -722,15 +1343,34 @@ def main():
         "  [2] Compliance Obligation Inference\n"
         "  [3] Process Constraint Violation Prediction\n"
         "  [4] Data Quality Defect Prediction\n"
-        "  [5] Business Impact Simulation",
+        "  [5] Business Impact Simulation\n\n"
+        "Data Ingestion:\n"
+        "  CSV | Turtle (TTL) | N-Triples | JSON / JSON-LD | RDF/XML",
         border_style="blue",
     ))
 
-    # --- Choose mode ----------------------------------------------------------
-    # Set TRAIN_MODE = True to fine-tune the model on the enterprise scenarios.
+    # ── Configuration ──────────────────────────────────────────────────────
+    # Set TRAIN_MODE = True  to fine-tune the model on the enterprise scenarios.
     # Set TRAIN_MODE = False for zero-shot demo using the base model.
-    TRAIN_MODE  = False
-    MODEL_NAME  = "google/gemma-2-2b-it"   # swap for any HF causal LLM
+    # Set FILE_DEMO  = True  to run the multi-format data ingestion demo
+    #                        (does NOT require a GPU or model download).
+    TRAIN_MODE = False
+    FILE_DEMO  = True          # ← flip to False to skip file demo
+    MODEL_NAME = "google/gemma-2-2b-it"
+
+    # ── Optional: load a custom KG from file before running inference ──────
+    # Uncomment and adjust path/task to use your own data:
+    #
+    # custom_ctx = load_kg_from_file(
+    #     "my_supply_chain.ttl",
+    #     task_type=TaskType.SUPPLY_CHAIN_IMPACT,
+    #     observation="...",
+    #     constraints=["...", "..."],
+    # )
+    # SCENARIOS[TaskType.SUPPLY_CHAIN_IMPACT] = custom_ctx
+
+    if FILE_DEMO:
+        run_file_demo()
 
     model, tokenizer = initialize_world_model(MODEL_NAME)
 
@@ -739,8 +1379,8 @@ def main():
 
     run_demo(model, tokenizer)
 
-    # --- Export scenario KG structures as JSON --------------------------------
-    export = {}
+    # ── Export scenario KG structures as JSON ──────────────────────────────
+    export: Dict[str, Any] = {}
     for task_type, ctx in SCENARIOS.items():
         export[task_type.value] = {
             "task":        task_type.value,
@@ -749,8 +1389,8 @@ def main():
             "constraints": ctx.constraints,
             "metadata":    ctx.metadata,
         }
-    with open("enterprise_scenarios.json", "w") as f:
-        json.dump(export, f, indent=2)
+    with open("enterprise_scenarios.json", "w", encoding="utf-8") as f:
+        json.dump(export, f, indent=2, ensure_ascii=False)
     console.print("[dim]Scenario KG structures exported to enterprise_scenarios.json[/dim]")
 
 
