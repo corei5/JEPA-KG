@@ -268,8 +268,6 @@ ground_truths[TaskType.SUPPLY_CHAIN_IMPACT] = load_from_corporate_memory(
 
 ## Research Background
 
-JEPA-KG is the technical backbone for the **SPRIND Next Frontier AI** application.
-
 The long-term goal is to evolve enterprise knowledge platforms from passive data fabrics into active self-simulating world models capable of causal reasoning, predictive simulation, policy-constrained planning, and autonomous enterprise agency.
 
 ---
