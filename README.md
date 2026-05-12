@@ -5,11 +5,11 @@
 [![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![Framework: PyTorch](https://img.shields.io/badge/Framework-PyTorch-ee4c2c.svg)](https://pytorch.org/)
 
-JEPA-KG applies the Joint-Embedding Predictive Architecture to Knowledge Graph (KG) reasoning. It fine-tunes a causal LLM with a dual-objective loss — standard language modelling combined with a JEPA alignment term — so that the model learns to predict structured KG outcomes from partial context, rather than only predicting the next token.
+JEPA-KG applies the Joint-Embedding Predictive Architecture to Knowledge Graph (KG) reasoning. It fine-tunes a causal LLM with a dual-objective loss, standard language modelling combined with a JEPA alignment term, so that the model learns to predict structured KG outcomes from partial context, rather than only predicting the next token.
 
 The primary benchmark is the **Hetionet** biomedical knowledge graph, where the task is: given a compound, predict its associated genes, diseases, side effects, pharmacological classes, and other entity relationships ranked by priority.
 
-> **Current approach & future direction:** Currently, knowledge graphs are serialised into textual triple sequences to fit the text-based JEPA definition and enable fine-tuning of causal LLMs. In future work, we aim to move beyond this text-conversion step and directly enhance the latent space of the knowledge graphs themselves — operating on graph-native representations rather than their textual proxies.
+> **Current approach & future direction:** Currently, knowledge graphs are serialised into textual triple sequences to fit the text-based JEPA definition and enable fine-tuning of causal LLMs. In future work, we aim to move beyond this text-conversion step and directly enhance the latent space of the knowledge graphs themselves, operating on graph-native representations rather than their textual proxies.
 
 ---
 
@@ -201,7 +201,7 @@ sbatch slurm/eval_hetionet.sbatch
 
 ### Metrics
 
-`eval_hetionet.py` scores entity-level **Precision**, **Recall**, and **F1** by extracting `- Name (Kind)` lines from generated and ground-truth responses and comparing them as sets. Exact-match scoring is unsuitable here because ground-truth answers are long ranked structured lists.
+`eval_hetionet.py` scores entity-level **Precision**, **Recall**, and **F1** by extracting `- Name (Kind)` lines from generated and ground-truth responses and comparing them as sets. Exact-match scoring is unsuitable here because ground-truth answers are long, ranked, structured lists.
 
 A per-priority breakdown is also computed (e.g. Gene Bindings, Side Effects, Similar Compounds, etc.).
 
@@ -226,7 +226,7 @@ The JEPA fine-tuned model improves recall by ~28× over the zero-shot base model
 
 ## Supported Base Models
 
-Any HuggingFace causal LLM with a chat template can be used. The `--last_token` offset is model-specific and controls which hidden state position is used for JEPA alignment:
+Any HuggingFace causal LLM with a chat template can be used. The `--last_token` offset is model-specific, and controls which hidden state position is used for JEPA alignment:
 
 | Model family | `--last_token` |
 |--------------|---------------|
@@ -267,15 +267,15 @@ pip install -e .
 
 Built on ideas from:
 
-- **Yann LeCun's Joint-Embedding Predictive Architecture (JEPA)** — the core self-supervised objective of aligning context and target representations in latent space, rather than predicting raw outputs
-- **Neuro-symbolic AI and knowledge graph engineering** — combining symbolic graph structure with neural representation learning
-- **Self-supervised world models and representation learning** — learning predictive models of structured environments without explicit supervision
+- **Yann LeCun's Joint-Embedding Predictive Architecture (JEPA)** : the core self-supervised objective of aligning context and target representations in latent space, rather than predicting raw outputs
+- **Neuro-symbolic AI and knowledge graph engineering** : combining symbolic graph structure with neural representation learning
+- **Self-supervised world models and representation learning** : learning predictive models of structured environments without explicit supervision
 
 ---
 
 ## Future Directions
 
-- **Graph-native latent representations** — move beyond serialising KGs to text; apply JEPA alignment directly in the embedding space of graph neural networks
-- **Temporal KG modelling** — extend to sequences of KG snapshots, enabling the model to learn how graph structure evolves over time
-- **Causal intervention simulation** — support do-calculus-style reasoning over KG state spaces to answer counterfactual questions
-- **Reinforcement learning over KG state spaces** — train agents to navigate and modify KG structure guided by JEPA-based world models
+- **Graph-native latent representations** : move beyond serialising KGs to text; apply JEPA alignment directly in the embedding space of graph neural networks
+- **Temporal KG modelling** : extend to sequences of KG snapshots, enabling the model to learn how graph structure evolves over time
+- **Causal intervention simulation** : support do-calculus-style reasoning over KG state spaces to answer counterfactual questions
+- **Reinforcement learning over KG state spaces** : train agents to navigate and modify KG structure guided by JEPA-based world models
