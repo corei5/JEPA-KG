@@ -2,26 +2,21 @@
 """
 
 import copy
-import math
 import numpy as np
-import os
-# import re
-import random
 import time
+import os
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.profiler import profile, ProfilerActivity
 import json
 from datasets import load_dataset
-import shutil
 from safetensors.torch import load_file
 from transformers import (
     AutoConfig,
     AutoTokenizer, 
     AutoModelForCausalLM,
     TrainingArguments,
-    TrainerCallback,
     Trainer,
     DataCollatorForLanguageModeling
 )
@@ -42,17 +37,8 @@ def get_user_messages(model_name, messages):
     return copy.deepcopy(messages)[1:2]
 
 
-# gsm8k_pattern = re.compile(r"\n#### (.+)$")
-
 
 def get_assistant_messages(model_name, dataset, messages):
-    # if dataset.startswith("gsm8k"):
-    #     messages = copy.deepcopy(messages)
-    #     gt_match = re.search(gsm8k_pattern, messages[2]["content"])
-    #     gt_answer = None if not gt_match else gt_match.group(1)
-    #     if gt_answer:
-    #         messages[2]["content"] = messages[2]["content"].replace(gt_answer, "")
-
     if "google/gemma" in model_name:
         assistant_messages = copy.deepcopy(messages)[2:3]
         assistant_messages[0]["role"] = "user"
@@ -62,9 +48,8 @@ def get_assistant_messages(model_name, dataset, messages):
 
 
 def load_and_prepare_dataset(data_file, tokenizer, model_name,
-                             max_length=2048, debug=0, predictors=0, regular=False, train_all=False,
-                             plain=False, front_pred=False, reverse_pred=False, linear=None, plain_jepa=False,
-                             random_span_mask=False, same_predictor=False):
+                             max_length=2048, debug=0, predictors=0, regular=False,
+                             linear=None, random_span_mask=False):
     """Load JSONL dataset and format for training with proper label masking"""
     
     # Load dataset
@@ -87,26 +72,20 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
         assistant_start_end_list = []
 
         for msg_idx, messages in enumerate(examples['messages']):
-            # Apply chat template if available, otherwise format manually
+            # Apply chat template
             full_messages = get_messages(model_name, messages)
-            if plain:
-                if train_all:
-                    formatted_chat = messages[1]["content"] + "<|eot_id|>"
-                else:
-                    formatted_chat = messages[1]["content"] + "\n<|perception|>" + messages[2]["content"] + "<|eot_id|>"
-            else:
-                formatted_chat = tokenizer.apply_chat_template(
-                    full_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+            formatted_chat = tokenizer.apply_chat_template(
+                full_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
             
             # Tokenize the formatted conversation with padding to max_length
             tokenized = tokenizer(
                 formatted_chat,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
+                padding="max_length",
                 return_tensors=None
             )
             
@@ -114,140 +93,53 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             attention_mask = tokenized["attention_mask"]
             
             # Create labels with proper masking
-            if train_all:
-                labels = create_labels_for_all(input_ids, attention_mask)
-            else:
-                labels = create_masked_labels(messages, tokenizer, input_ids, attention_mask)
+            labels = create_masked_labels(messages, tokenizer, input_ids, attention_mask)
             
             input_ids_list.append(input_ids)
             labels_list.append(labels)
             attention_mask_list.append(attention_mask)
 
-            if data_file.startswith("hellaswag"):
-                user_messages = examples["text"][msg_idx]
-                if debug == 8:
-                    print(json.dumps(messages, indent=2))
-                    print(json.dumps(user_messages, indent=2))
-            else:
-                if reverse_pred:
-                    user_messages = get_assistant_messages(model_name, data_file, messages)
-                else:
-                    user_messages = get_user_messages(model_name, messages)
+            user_messages = get_user_messages(model_name, messages)
             to_add = predictors
             while to_add > 0:
-                if front_pred:
-                    user_messages[0]["content"] = f"<|predictor_{to_add}|>" + user_messages[0]["content"]
-                else:
-                    if same_predictor:
-                        user_messages[0]["content"] += f"<|predictor_1|>"
-                    else:
-                        user_messages[0]["content"] += f"<|predictor_{to_add}|>"
+                user_messages[0]["content"] += f"<|predictor_{to_add}|>"
                 to_add -= 1
-            if plain or plain_jepa:
-                formatted_chat_user = user_messages[0]["content"]
-            else:
-                formatted_chat_user = tokenizer.apply_chat_template(
-                    user_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+            formatted_chat_user = tokenizer.apply_chat_template(
+                user_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
             tokenized_user = tokenizer(
                 formatted_chat_user,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
+                padding="max_length",
                 return_tensors=None
             )
             user_input_ids_list.append(tokenized_user["input_ids"])
             user_labels_list.append([-100] * len(tokenized_user["input_ids"]))
             user_attention_mask_list.append(tokenized_user["attention_mask"])
-            if data_file.startswith("hellaswag"):
-                content = examples["text"][msg_idx][0]["content"] + "\n"
-                user_start, user_end = find_start_end(content, tokenizer, input_ids, attention_mask)
-            elif "allenai/OLMo" in model_name:
-                content = messages[1]["content"] + "\n"
-                user_start, user_end = find_start_end(content, tokenizer, input_ids, attention_mask)
-            else:
-                user_start, user_end = find_start_end(messages[1]["content"], tokenizer, input_ids, attention_mask)
+            user_start, user_end = find_start_end(messages[1]["content"], tokenizer, input_ids, attention_mask)
             user_start_end_list.append([user_start, user_end])
 
-            if data_file.startswith("hellaswag"):
-                assistant_messages = examples["code"][msg_idx]
-                if debug == 8:
-                    print(json.dumps(assistant_messages, indent=2))
-                    exit(0)
-            else:
-                if reverse_pred:
-                    assistant_messages = get_user_messages(model_name, messages)
-                else:
-                    assistant_messages = get_assistant_messages(model_name, data_file, messages)
-            if plain or plain_jepa:
-                formatted_chat_assistant = assistant_messages[0]["content"]
-            else:
-                formatted_chat_assistant = tokenizer.apply_chat_template(
-                    assistant_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+            assistant_messages = get_assistant_messages(model_name, data_file, messages)
+            formatted_chat_assistant = tokenizer.apply_chat_template(
+                assistant_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
             tokenized_assistant = tokenizer(
                 formatted_chat_assistant,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Pad to max_length for consistent tensor shapes
+                padding="max_length",
                 return_tensors=None
             )
             assistant_input_ids_list.append(tokenized_assistant["input_ids"])
             assistant_labels_list.append([-100] * len(tokenized_assistant["input_ids"]))
             assistant_attention_mask_list.append(tokenized_assistant["attention_mask"])
-            if data_file.startswith("hellaswag"):
-                content = examples["code"][msg_idx][0]["content"]
-                content = " " + content + "\n"
-                # if messages[2]["content"] != "D":
-                #     content += "\n"
-                assistant_start, assistant_end = find_start_end(content, tokenizer, input_ids, attention_mask)
-            elif "apple/OpenELM" in model_name:
-                try:
-                    assistant_start, assistant_end = find_start_end(messages[2]["content"], tokenizer, input_ids, attention_mask)
-                except AssertionError:
-                    content = "\n" + messages[2]["content"]
-                    assistant_start, assistant_end = find_start_end(content, tokenizer, input_ids, attention_mask, remove_leading_newline=True)
-                    # TODO: see if this is needed? (assistant_start += 1)
-            else:
-                assistant_start, assistant_end = find_start_end(messages[2]["content"], tokenizer, input_ids, attention_mask)
+            assistant_start, assistant_end = find_start_end(messages[2]["content"], tokenizer, input_ids, attention_mask)
             assistant_start_end_list.append([assistant_start, assistant_end])
-
-            if debug == 3 and torch.cuda.current_device() == 0:
-                print(messages)
-                print(input_ids_list)
-                print(tokenizer.decode(input_ids_list[0]))
-                print(labels_list)
-                print(tokenizer.decode([item for item in labels_list[0] if item != -100]))
-                print(attention_mask_list)
-                print("user Token IDs:", tokenized_user["input_ids"])
-                print("user Decoded:", tokenizer.decode(tokenized_user["input_ids"]))
-                print("assistant Token IDs:", tokenized_assistant["input_ids"])
-                print("assistant Decoded:", tokenizer.decode(tokenized_assistant["input_ids"]))
-        
-            if debug == 3:
-                exit(0)
-            
-            def print_indexed_list(list_of):
-                to_print = []
-                for i, item in enumerate(list_of):
-                    to_print.append(f"{i}:{item}")
-                print("[" + ", ".join(to_print) + "]")
-            if debug == 9 and torch.cuda.current_device() == 0:
-                print("input_ids")
-                print_indexed_list(input_ids)
-                print("decoded input_ids")
-                print_indexed_list([tokenizer.decode(item) for item in input_ids])
-                print(f"user content: {messages[1]['content']}")
-                print(f"assistant content: {messages[2]['content']}")
-                print(f"user start end: {user_start_end_list[0]}")
-                print(f"assistant start end: {assistant_start_end_list[0]}")
-
-            if debug == 9:
-                exit(0)
 
         if regular:
             return {
@@ -276,70 +168,23 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
                 "attention_mask_assistant": assistant_attention_mask_list,
             }
     
-    # def format_messages_manually(messages):
-    #     """Manual formatting when chat template is not available"""
-    #     formatted_parts = []
-        
-    #     for msg in messages:
-    #         role = msg['role']
-    #         content = msg['content']
-            
-    #         if role == 'system':
-    #             formatted_parts.append(f"<|system|>\n{content}")
-    #         elif role == 'user':
-    #             formatted_parts.append(f"<|user|>\n{content}")
-    #         elif role == 'assistant':
-    #             formatted_parts.append(f"<|assistant|>\n{content}")
-        
-    #     return "\n\n".join(formatted_parts) + "<|end|>"
-    
-    def create_labels_for_all(input_ids, attention_mask):
-        """
-        Create labels for all tokens except padding (mask those with -100).
-        """
-        labels = []
-        for i, mask in enumerate(attention_mask):
-            if mask == 0:  # Padding token
-                labels.append(-100)
-            else:
-                labels.append(input_ids[i])
-        return labels
-
     def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
         """Create labels with input tokens masked (-100)"""
         labels = [-100] * len(input_ids)
-        
-        # Mask padding tokens in labels
-        for i, mask in enumerate(attention_mask):
-            if mask == 0:  # Padding token
-                labels[i] = -100
         
         # Find assistant responses and unmask only those tokens
         for msg in messages:
             if msg['role'] == 'assistant':
                 assistant_content = msg['content']
-                
-                # Find where this assistant response appears in the tokenized text
                 assistant_tokens = tokenizer.encode(assistant_content, add_special_tokens=False)
-                
-                # Find the position of assistant response in input_ids
                 decoded_assistant = [tokenizer.decode(item) for item in assistant_tokens]
                 decoded_input = [tokenizer.decode(item) for item in input_ids]
                 for i in range(len(input_ids) - len(assistant_tokens) + 1):
-                    # Only check non-padding tokens
-                    if debug == 4 and torch.cuda.current_device() == 0:
-                        print(f"=======input_ids: {input_ids[i:i+len(assistant_tokens)]}")
-                        print(f"assistant_tokens: {assistant_tokens}")
-                    # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
                     if attention_mask[i] == 1 and decoded_input[i:i+len(assistant_tokens)] == decoded_assistant:
-                        # Unmask the assistant response tokens
                         for j in range(i, min(i + len(assistant_tokens), len(input_ids))):
-                            if attention_mask[j] == 1:  # Only unmask non-padding tokens
+                            if attention_mask[j] == 1:
                                 labels[j] = input_ids[j]
                         break
-                
-                if debug == 4:
-                    exit(0)
         
         return labels
     
@@ -349,13 +194,9 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             to_print.append(f"{i}:{item}")
         print("[" + ", ".join(to_print) + "]")
 
-    def find_start_end(content, tokenizer, input_ids, attention_mask, remove_leading_newline=False):
+    def find_start_end(content, tokenizer, input_ids, attention_mask):
         """Find the start and end index of the content in the input_ids."""
         tokens = tokenizer.encode(content, add_special_tokens=False)
-        if remove_leading_newline:
-            if "apple/OpenELM" in model_name:
-                assert tokens[0] == 29871 and tokens[1] == 13, f"{tokens[0]} != 29871 or {tokens[1]} != 13"
-                tokens = tokens[2:]
         decoded_content = [tokenizer.decode(item) for item in tokens]
         decoded_input = [tokenizer.decode(item) for item in input_ids]
         if debug == 15 and torch.cuda.current_device() == 0:
@@ -364,12 +205,7 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
             print_indexed_array(decoded_input)
             print_indexed_array(input_ids)
         for i in range(len(input_ids) - len(tokens), -1, -1):
-            if debug == 12 and torch.cuda.current_device() == 0:
-                print(f"=======input_ids: {input_ids[i:i+len(tokens)]}")
-                print(f"assistant_tokens: {tokens}")
-            # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
             if attention_mask[i] == 1 and decoded_input[i:i+len(tokens)] == decoded_content:
-                # Unmask the assistant response tokens
                 if debug == 12 and torch.cuda.current_device() == 0:
                     print(f"start: {i}, end: {i + len(tokens) - 1}")
                 if debug == 12:
@@ -388,105 +224,6 @@ def load_and_prepare_dataset(data_file, tokenizer, model_name,
     )
     
     return tokenized_dataset
-
-
-# def use_llama_3_2_chat_template(tokenizer):
-#     llama_3_2_chat_template = """{{- bos_token }}
-# {%- if custom_tools is defined %}
-#     {%- set tools = custom_tools %}
-# {%- endif %}
-# {%- if not tools_in_user_message is defined %}
-#     {%- set tools_in_user_message = true %}
-# {%- endif %}
-# {%- if not date_string is defined %}
-#     {%- if strftime_now is defined %}
-#         {%- set date_string = strftime_now("%d %b %Y") %}
-#     {%- else %}
-#         {%- set date_string = "26 Jul 2024" %}
-#     {%- endif %}
-# {%- endif %}
-# {%- if not tools is defined %}
-#     {%- set tools = none %}
-# {%- endif %}
-
-# {#- This block extracts the system message, so we can slot it into the right place. #}
-# {%- if messages[0]['role'] == 'system' %}
-#     {%- set system_message = messages[0]['content']|trim %}
-#     {%- set messages = messages[1:] %}
-# {%- else %}
-#     {%- set system_message = "" %}
-# {%- endif %}
-
-# {#- System message #}
-# {{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
-# {%- if tools is not none %}
-#     {{- "Environment: ipython\n" }}
-# {%- endif %}
-# {{- "Cutting Knowledge Date: December 2023\n" }}
-# {{- "Today Date: " + date_string + "\n\n" }}
-# {%- if tools is not none and not tools_in_user_message %}
-#     {{- "You have access to the following functions. To call a function, please respond with JSON for a function call." }}
-#     {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
-#     {{- "Do not use variables.\n\n" }}
-#     {%- for t in tools %}
-#         {{- t | tojson(indent=4) }}
-#         {{- "\n\n" }}
-#     {%- endfor %}
-# {%- endif %}
-# {{- system_message }}
-# {{- "<|eot_id|>" }}
-
-# {#- Custom tools are passed in a user message with some extra guidance #}
-# {%- if tools_in_user_message and not tools is none %}
-#     {#- Extract the first user message so we can plug it in here #}
-#     {%- if messages | length != 0 %}
-#         {%- set first_user_message = messages[0]['content']|trim %}
-#         {%- set messages = messages[1:] %}
-#     {%- else %}
-#         {{- raise_exception("Cannot put tools in the first user message when there's no first user message!") }}
-# {%- endif %}
-#     {{- '<|start_header_id|>user<|end_header_id|>\n\n' -}}
-#     {{- "Given the following functions, please respond with a JSON for a function call " }}
-#     {{- "with its proper arguments that best answers the given prompt.\n\n" }}
-#     {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
-#     {{- "Do not use variables.\n\n" }}
-#     {%- for t in tools %}
-#         {{- t | tojson(indent=4) }}
-#         {{- "\n\n" }}
-#     {%- endfor %}
-#     {{- first_user_message + "<|eot_id|>"}}
-# {%- endif %}
-
-# {%- for message in messages %}
-#     {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}
-#         {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}
-#     {%- elif 'tool_calls' in message %}
-#         {%- if not message.tool_calls|length == 1 %}
-#             {{- raise_exception("This model only supports single tool-calls at once!") }}
-#         {%- endif %}
-#         {%- set tool_call = message.tool_calls[0].function %}
-#         {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}
-#         {{- '{"name": "' + tool_call.name + '", ' }}
-#         {{- '"parameters": ' }}
-#         {{- tool_call.arguments | tojson }}
-#         {{- "}" }}
-#         {{- "<|eot_id|>" }}
-#     {%- elif message.role == "tool" or message.role == "ipython" %}
-#         {{- "<|start_header_id|>ipython<|end_header_id|>\n\n" }}
-#         {%- if message.content is mapping or message.content is iterable %}
-#             {{- message.content | tojson }}
-#         {%- else %}
-#             {{- message.content }}
-#         {%- endif %}
-#         {{- "<|eot_id|>" }}
-#     {%- endif %}
-# {%- endfor %}
-# {%- if add_generation_prompt %}
-#     {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
-# {%- endif %}
-# """
-#     if tokenizer.chat_template != llama_3_2_chat_template:
-#         tokenizer.chat_template = llama_3_2_chat_template
 
 
 class LinearPredictor(nn.Module):
@@ -514,28 +251,16 @@ def set_seeds(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=False, debug=0, seed=None, linear_predictor=False, load_lp=False):
+def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, debug=0, seed=None, linear_predictor=False):
     """Setup model and tokenizer with optional LoRA"""
     
     # Load tokenizer
-    if "apple/OpenELM" in model_name:
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
-        tokenizer.chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        assert tokenizer.chat_template is not None, f"{model_name} does not have chat template."
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    assert tokenizer.chat_template is not None, f"{model_name} does not have chat template."
     
-    # use_llama_3_2_chat_template(tokenizer)
-    
-    # Add special tokens if not present
-    if "microsoft/phi" in model_name:
-        tokenizer.add_special_tokens({"bos_token": "<|startoftext|>"})
-        if torch.cuda.current_device() == 0:
-            print("Added <|startoftext|> token")
-
     special_tokens = ["<|predictor_1|>", "<|predictor_2|>", "<|predictor_3|>", "<|predictor_4|>", "<|predictor_5|>",
                       "<|predictor_6|>", "<|predictor_7|>", "<|predictor_8|>", "<|predictor_9|>", "<|predictor_10|>",
-                      "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|perception|>"]
+                      "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"]
     new_tokens = [token for token in special_tokens if token not in tokenizer.vocab]
     
     if new_tokens:
@@ -562,54 +287,15 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             # For multi-GPU with torchrun, don't use device_map
             device_map = None
     
-    if pretrain:
-        if seed is not None:
-            torch.manual_seed(seed)
-        config = AutoConfig.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_config(
-            config,
-            torch_dtype=torch.bfloat16,
-        )
-        rank = torch.distributed.get_rank()
-        device = torch.device(f"cuda:{rank}")
-        model.to(device)
-        for p in model.parameters():
-            torch.distributed.broadcast(p.data, src=0)
-        for b in model.buffers():
-            torch.distributed.broadcast(b.data, src=0)
-        if debug == 6:
-            for name, param in model.named_parameters():
-                print(f"Parameter name: {name}, Shape: {param.shape}")
-                print(param)
-                exit(0)
-    elif load_lp:
-        config = AutoConfig.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_config(
-            config,
-            torch_dtype=torch.bfloat16,
-        )
-        if not hasattr(model.config, "hidden_size"):
-            d = model.config.model_dim
-        else:
-            d = model.config.hidden_size
-        model.linear_predictor = LinearPredictor(d)
-        state_dict = load_file(os.path.join(model_name, "model.safetensors"))
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            trust_remote_code=True,
-            # Add these for better multi-GPU stability
-            low_cpu_mem_usage=True,
-            use_cache=False,  # Disable KV cache for training
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        use_cache=False,
+    )
 
-    if new_tokens:
-        model.resize_token_embeddings(len(tokenizer))
-    
-    # Resize embeddings if we added new tokens
     if new_tokens:
         model.resize_token_embeddings(len(tokenizer))
     
@@ -629,14 +315,13 @@ def setup_model_and_tokenizer(model_name, use_lora=True, lora_rank=16, pretrain=
             model.print_trainable_parameters()
 
     if linear_predictor:
-        if not load_lp:
-            if seed is not None:
-                set_seeds(seed)
-            if not hasattr(model.config, "hidden_size"):
-                d = model.config.model_dim
-            else:
-                d = model.config.hidden_size
-            model.linear_predictor = LinearPredictor(d)
+        if seed is not None:
+            set_seeds(seed)
+        if not hasattr(model.config, "hidden_size"):
+            d = model.config.model_dim
+        else:
+            d = model.config.hidden_size
+        model.linear_predictor = LinearPredictor(d)
         if debug == 10:
             print(model.linear_predictor.M.weight)
 
@@ -1269,33 +954,6 @@ class RepresentationTrainer(Trainer):
             print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
 
         return (total_loss, main_outputs) if return_outputs else total_loss
-
-
-class ProfilerFLOPCallback(TrainerCallback):
-    def __init__(self, profile_steps=10):
-        self.profile_steps = profile_steps
-        self.total_flops = 0
-        
-    def on_step_begin(self, args, state, control, **kwargs):
-        if state.global_step < self.profile_steps:
-            self.profiler = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                with_flops=True  # This enables FLOP counting if available
-            )
-            self.profiler.__enter__()
-    
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step < self.profile_steps:
-            self.profiler.__exit__(None, None, None)
-            
-            # Extract FLOP information
-            events = self.profiler.key_averages()
-            step_flops = sum(event.flops for event in events if event.flops > 0)
-            self.total_flops += step_flops
-            
-            if torch.cuda.current_device() == 0:  # and (state.global_step == 63 or state.global_step % 10 == 0):
-                print(f"Step {state.global_step}: FLOPs: {step_flops:,.0f}")
 
 
 def main():

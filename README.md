@@ -1,103 +1,85 @@
-# JEPA-KG: Enterprise World Model
-### Neuro-Symbolic Predictive Intelligence for the Self-Understanding Enterprise
+# JEPA-KG
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+**Knowledge Graph Reasoning with Joint-Embedding Predictive Architecture (JEPA)**
+
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![Framework: PyTorch](https://img.shields.io/badge/Framework-PyTorch-ee4c2c.svg)](https://pytorch.org/)
 
----
+JEPA-KG applies the Joint-Embedding Predictive Architecture to Knowledge Graph (KG) reasoning. It fine-tunes a causal LLM with a dual-objective loss — standard language modelling combined with a JEPA alignment term — so that the model learns to predict structured KG outcomes from partial context, rather than only predicting the next token.
 
-## What Is This?
+The primary benchmark is the **Hetionet** biomedical knowledge graph, where the task is: given a compound, predict its associated genes, diseases, side effects, pharmacological classes, and other entity relationships ranked by priority.
 
-JEPA-KG is a **neuro-symbolic enterprise world model**, a compact, predictive model of how an organisation's objects, rules, processes, people, systems, and external constraints interact and evolve over time.
-
-It moves beyond standard LLMs (which predict tokens) by learning **causal enterprise dynamics**: given a structured Knowledge Graph representation of an organisational state, it predicts how that state transitions — across supply chains, compliance obligations, business processes, data pipelines, and strategic scenarios.
+> **Current approach & future direction:** Currently, knowledge graphs are serialised into textual triple sequences to fit the text-based JEPA definition and enable fine-tuning of causal LLMs. In future work, we aim to move beyond this text-conversion step and directly enhance the latent space of the knowledge graphs themselves — operating on graph-native representations rather than their textual proxies.
 
 ---
 
-## Five Core Capabilities
+## Repository Structure
 
-| # | Task | What It Does |
-|---|------|-------------|
-| 1 | **Supply Chain Cascade Prediction** | Given a component delay, predicts every downstream production, financial, and contractual impact step by step |
-| 2 | **Compliance Obligation Inference** | Given a product, its markets, and known regulations, infers *all* missing compliance obligations, including those not yet stated |
-| 3 | **Process Violation Prediction** | Scans a running business process against its constraints and predicts which steps will breach SLAs, regulations, or policies before they do |
-| 4 | **Data Quality Defect Prediction** | Analyses a data pipeline and its recent changes to predict data quality failures before they corrupt downstream reports and decisions |
-| 5 | **Business Impact Simulation** | Simulates the full financial, operational, regulatory, and ESG impact of changing a supplier, material, policy, or workflow |
+```
+JEPA-KG/
+├── stp.py                     # Core training script — RepresentationTrainer + data loading
+├── eval_hetionet.py           # Evaluation script — entity-level Precision/Recall/F1 on Hetionet
+├── run_hetionet_stp.sh        # Shell script to launch Hetionet JEPA fine-tuning via torchrun
+├── pyproject.toml             # Project dependencies
+├── datasets/
+│   ├── hetionet_train.jsonl   # Training split (compound → KG entity predictions)
+│   └── hetionet_test.jsonl    # Test split
+├── eval/
+│   ├── eval_hetionet_jepa.jsonl          # Per-example results for JEPA fine-tuned model
+│   ├── eval_hetionet_jepa_summary.json   # Aggregate metrics for JEPA model
+│   ├── eval_hetionet_base.jsonl          # Per-example results for base LLaMA-3.2-1B
+│   └── eval_hetionet_base_summary.json   # Aggregate metrics for base model
+└── slurm/
+    ├── run_hetionet_jepa.sbatch   # SLURM job for JEPA fine-tuning (4× GPU)
+    └── eval_hetionet.sbatch       # SLURM job for evaluation
+```
 
 ---
 
-## Architecture
+## How It Works
 
-### Dual-Objective Training
+### Training Objective
 
-The model optimises two losses simultaneously:
-
-```
-Total Loss = λ_lm  × CrossEntropy(token prediction)
-           + λ_jepa × (1 − cosine_similarity(z_context, z_target))
-```
-
-**Generative branch (λ_lm):** Standard transformer language modelling for natural language interaction, knowledge retrieval, and prediction output generation.
-
-**JEPA branch (λ_jepa):** Forces the model's latent representation of an observed enterprise state (z_context) to align with the latent representation of the resulting outcome (z_target). This is what makes the model learn causal enterprise dynamics rather than surface-level token co-occurrence.
-
-### Knowledge Graph Serialisation
-
-Enterprise state is expressed as RDF-style triples wrapped in modality tokens:
+The model is trained with two simultaneous objectives:
 
 ```
-<|kg_start|>
-(Supplier_Taiwan_Semi, delayedBy, 6_weeks)
-(Microcontroller_MCU_X7, stockLevel, 3_days_supply)
-(ECU_Module_B, noSubstitute, true)
-(Plant_Stuttgart, dailyOutput, 850_units)
-<|kg_end|>
-<|observation|> Taiwan Semiconductor has notified a 6-week delay ...
-[constraints: JIT policy: max 5-day buffer; OEM penalty €120k/day]
-<|predictor_1|> <|predictor_2|> <|predictor_3|> <|predictor_4|>
+Total Loss = CrossEntropy(token prediction)
+           + λ × (1 − cosine_similarity(z_context, z_target))
 ```
+
+- **Language modelling loss**: predicts the assistant response tokens from the full conversation.
+- **JEPA alignment loss** (weighted by `λ`, default `0.05`): forces the hidden representation at the end of the user/context block to align with the representation at the end of the target/answer block. This encourages the model to encode the *semantics of the answer* into its context representation before generating.
+
+The JEPA alignment is implemented in the `RepresentationTrainer` class in `stp.py`. The `linear` mode (`--linear=random_span`) uses a random span of the full context-answer sequence as the JEPA target.
 
 ### Predictor Tokens
 
-Learnable latent transition operators inserted between context and prediction:
+Learnable special tokens `<|predictor_1|>` … `<|predictor_N|>` are appended to user messages (controlled by `--predictors`). In the Hetionet experiments, 128 predictor tokens are used. These tokens act as a latent bottleneck through which the model routes its predictions.
 
-```
-<|predictor_1|> ... <|predictor_8|>
-```
+### Data Format
 
-During training, these tokens learn to encode enterprise state transitions in latent space. In inference, they act as a "simulation buffer" between the observed state and the predicted outcome.
+Each training and test example is a three-turn conversation in JSONL format:
 
-### Modality Tokens
-
-Separate namespaces for different cognitive modes:
-
-| Token | Purpose |
-|-------|---------|
-| `<|kg_start|>` / `<|kg_end|>` | Knowledge Graph triple block |
-| `<|observation|>` | Natural language event description |
-| `<|supply_chain|>` | Supply chain domain context |
-| `<|compliance|>` | Regulatory/compliance domain context |
-| `<|process|>` | Business process domain context |
-| `<|data_quality|>` | Data pipeline domain context |
-| `<|simulation|>` | Change simulation domain context |
-| `<|impact|>` | Predicted enterprise outcome |
-| `<|governed_action|>` | Policy/SHACL-constrained output |
-
----
-
-## Requirements
-
-```
-NVIDIA GPU (16GB VRAM minimum, 24GB+ recommended)
-CUDA 11.8+
-Python 3.9+
+```json
+{
+  "messages": [
+    {"role": "system",    "content": "...task instructions..."},
+    {"role": "user",      "content": "...compound context + predictor tokens..."},
+    {"role": "assistant", "content": "...ranked entity list by priority..."}
+  ]
+}
 ```
 
-For CPU/MPS (slower, for development):
+The assistant response lists predicted entities as:
 
 ```
-Any modern multi-core CPU or Apple Silicon Mac
+[Priority 1] Gene Bindings (Gene)
+- TP53 (Gene)
+- BRCA1 (Gene)
+
+[Priority 2] Similar Compounds (Compound)
+- Aspirin (Compound)
+...
 ```
 
 ---
@@ -105,121 +87,179 @@ Any modern multi-core CPU or Apple Silicon Mac
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/jepa-kg.git
-cd jepa-kg
-
-pip install torch transformers peft accelerate bitsandbytes datasets rich
+git clone <repo-url>
+cd JEPA-KG
+pip install -e .
 ```
 
----
-
-## Quick Start
-
-### Run the Demo (Zero-Shot Mode)
-
-Runs all five enterprise tasks using the base LLM with structured KG prompts, no fine-tuning required:
+Or install dependencies directly:
 
 ```bash
-python enterprise_world_model.py
+pip install torch transformers peft accelerate datasets safetensors rich pandas tqdm
 ```
 
-This will:
-
-1. Load the base model (Gemma-2-2B-IT by default)
-2. Display structured predictions in the terminal
-3. Export scenario KG structures to `enterprise_scenarios.json`
-
-### Enable Fine-Tuning
-
-In `enterprise_world_model.py`, set:
-
-```python
-TRAIN_MODE = True
-```
-
-This runs LoRA fine-tuning on the five scenario templates before inference. Replace the `ground_truths` dict inside `build_training_dataset()` with real historical enterprise outcomes for production use.
-
-### Swap the Base Model
-
-```python
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"   # or any HF causal LLM
-```
+> **Optional:** `pip install rdflib` enables RDF/Turtle/N-Triples ingestion in `JEPA-KG.py`.
 
 ---
 
+## Hetionet Fine-Tuning
 
+### Quick Start (local, 4 GPUs)
+
+```bash
+bash run_hetionet_stp.sh
+# or with custom parameters:
+bash run_hetionet_stp.sh meta-llama/Llama-3.2-1B-Instruct 2e-5 0.05 42
+```
+
+Arguments (all optional, positional):
+
+| Position | Argument | Default |
+|----------|----------|---------|
+| 1 | `model_name` | `meta-llama/Llama-3.2-1B-Instruct` |
+| 2 | `learning_rate` | `2e-5` |
+| 3 | `lbd` (JEPA weight λ) | `0.05` |
+| 4 | `seed` | `42` |
+
+The script calls `torchrun --nproc_per_node=4 stp.py` with the following key settings:
+
+- `--predictors=128` — 128 predictor tokens appended to user messages
+- `--max_length=2048` — KG examples are longer than typical NLP tasks
+- `--num_epochs=3`
+- `--linear=random_span` — random-span JEPA alignment mode
+- Output saved to `trained_models/ft-hetionet-jepa-<lr>-<lbd>-<seed>/`
+
+### SLURM (HPC cluster)
+
+```bash
+sbatch slurm/run_hetionet_jepa.sbatch
+```
+
+Requests 4 GPUs on the `dc-hwai` partition. Edit the `--account` field before submitting.
 
 ---
 
-## Extending the Model
+## `stp.py` — Training Script
 
-### Adding a New Enterprise Scenario
+`stp.py` is the core training module. It implements:
 
-```python
-from enterprise_world_model import EnterpriseContext, KGTriple, TaskType, SCENARIOS
+| Component | Description |
+|-----------|-------------|
+| `load_and_prepare_dataset` | Loads JSONL, applies chat template, tokenizes, creates masked labels and user/assistant start-end indices |
+| `LinearPredictor` | Optional linear projection layer (d → d) used as a latent predictor head |
+| `setup_model_and_tokenizer` | Loads model + tokenizer, adds special tokens, applies LoRA, optionally initializes `LinearPredictor` |
+| `RepresentationTrainer` | HuggingFace `Trainer` subclass implementing the dual-objective loss and all JEPA representation alignment modes |
 
-SCENARIOS[TaskType.SUPPLY_CHAIN_IMPACT] = EnterpriseContext(
-    task_type=TaskType.SUPPLY_CHAIN_IMPACT,
-    triples=[
-        KGTriple("Supplier_A", "delivers", "Component_X"),
-        KGTriple("Component_X", "delayedBy", "3_weeks"),
-        # add all relevant triples
-    ],
-    observation="Your natural language description of the event.",
-    constraints=[
-        "Policy or regulatory constraint 1",
-        "SLA constraint 2",
-    ],
-    metadata={"domain": "your_domain"},
-)
-```
+#### Key CLI Flags for `stp.py`
 
-### Connecting to a Real Knowledge Graph
-
-Replace the static `SCENARIOS` dict with a live KG query:
-
-```python
-# SPARQL query to eccenca Corporate Memory (or any SPARQL endpoint)
-from SPARQLWrapper import SPARQLWrapper, JSON
-
-sparql = SPARQLWrapper("https://your-kg-endpoint/sparql")
-sparql.setQuery("""
-    SELECT ?s ?p ?o WHERE {
-        ?s ?p ?o .
-        FILTER(?s = <urn:supplier:taiwan-semi>)
-    }
-""")
-results = sparql.query().convert()
-triples = [KGTriple(r["s"]["value"], r["p"]["value"], r["o"]["value"])
-           for r in results["results"]["bindings"]]
-```
-
-### Training on Real Historical Data
-
-```python
-# In build_training_dataset(), replace ground_truths with real outcomes:
-ground_truths[TaskType.SUPPLY_CHAIN_IMPACT] = load_from_corporate_memory(
-    query="SELECT outcome WHERE disruption_id = 'event_2024_q3_taiwan'"
-)
-```
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model_name` | Base model (HF hub or local path) | required |
+| `--train_file` | Training JSONL path | required |
+| `--eval_file` | Evaluation JSONL path | — |
+| `--output_dir` | Where to save the fine-tuned model | required |
+| `--learning_rate` | AdamW learning rate | `2e-5` |
+| `--num_epochs` | Training epochs | `3` |
+| `--lbd` | JEPA loss weight (λ) | `0.05` |
+| `--predictors` | Number of predictor tokens appended to user context | `0` |
+| `--max_length` | Max token sequence length | `2048` |
+| `--lora_rank` | LoRA rank | `16` |
+| `--linear` | JEPA alignment mode: `random_span` or unset | `None` |
+| `--last_token` | Token offset for representation extraction (model-specific) | `-2` |
+| `--finetune_seed` | Random seed | `42` |
+| `--debug` | Debug verbosity level (0 = off) | `0` |
 
 ---
 
 ## Evaluation
 
-| Domain | Predictive Task | Key Metric |
-|--------|----------------|------------|
-| Automotive | Supply Chain Cascade | Entity recall vs. actual affected systems |
-| Life Sciences | Compliance Inference | Obligation recall vs. legal review checklist |
-| Financial Services | Process Violation | Precision/recall of constraint breach prediction |
-| Data Engineering | Data Quality Defect | Defect detection rate before pipeline run |
-| Pharmaceuticals | Business Simulation | Decision alignment vs. expert committee outcome |
+### Run Evaluation
+
+```bash
+# Evaluate JEPA fine-tuned model
+python eval_hetionet.py \
+  --model_name trained_models/ft-hetionet-jepa-2e-5-0.05-42 \
+  --original_model_name meta-llama/Llama-3.2-1B-Instruct \
+  --input_file datasets/hetionet_test.jsonl \
+  --output_file eval/eval_hetionet_jepa.jsonl \
+  --max_new_tokens 512
+
+# Evaluate base model (zero-shot baseline)
+python eval_hetionet.py \
+  --model_name meta-llama/Llama-3.2-1B-Instruct \
+  --original_model_name meta-llama/Llama-3.2-1B-Instruct \
+  --input_file datasets/hetionet_test.jsonl \
+  --output_file eval/eval_hetionet_base.jsonl \
+  --max_new_tokens 512
+```
+
+Or via SLURM:
+
+```bash
+sbatch slurm/eval_hetionet.sbatch
+```
+
+### Metrics
+
+`eval_hetionet.py` scores entity-level **Precision**, **Recall**, and **F1** by extracting `- Name (Kind)` lines from generated and ground-truth responses and comparing them as sets. Exact-match scoring is unsuitable here because ground-truth answers are long ranked structured lists.
+
+A per-priority breakdown is also computed (e.g. Gene Bindings, Side Effects, Similar Compounds, etc.).
+
+### Results on Hetionet (199 test examples)
+
+| Model | Precision | Recall | F1 |
+|-------|-----------|--------|----|
+| LLaMA-3.2-1B-Instruct (base, zero-shot) | 0.009 | 0.003 | 0.005 |
+| LLaMA-3.2-1B-Instruct + JEPA fine-tuning | 0.085 | 0.094 | 0.086 |
+
+**Per-priority recall (JEPA fine-tuned):**
+
+| Priority Section | Recall | F1 |
+|-----------------|--------|----|
+| Similar Diseases | 0.305 | 0.186 |
+| Gene Bindings | 0.122 | 0.105 |
+| Similar Compounds | 0.108 | 0.086 |
+| Pharmacologic Classes | 0.071 | 0.077 |
+| Side Effects | 0.017 | 0.017 |
+
+The JEPA fine-tuned model improves recall by ~28× over the zero-shot base model, demonstrating that the representational alignment objective teaches the model the structure of KG neighbourhood prediction.
+
+## Supported Base Models
+
+Any HuggingFace causal LLM with a chat template can be used. The `--last_token` offset is model-specific and controls which hidden state position is used for JEPA alignment:
+
+| Model family | `--last_token` |
+|--------------|---------------|
+| `meta-llama/Llama-3.2-*` | `-2` |
+| `google/gemma-*` | `-2` |
+| `Qwen/Qwen*` | `-3` |
+| `allenai/OLMo-2*` | `-1` |
+| `deepseek-ai/DeepSeek*` | `-1` |
+| `apple/OpenELM*` | `-4` |
 
 ---
 
-## Research Background
+## Dependencies
 
-The long-term goal is to evolve enterprise knowledge platforms from passive data fabrics into active self-simulating world models capable of causal reasoning, predictive simulation, policy-constrained planning, and autonomous enterprise agency.
+Managed via `pyproject.toml`. Core requirements:
+
+```
+torch >= 2.10
+transformers >= 5.3
+peft >= 0.18
+accelerate >= 1.13
+datasets >= 4.7
+safetensors >= 0.7
+rich >= 14.3
+pandas >= 3.0
+tqdm >= 4.67
+```
+
+Install all:
+
+```bash
+pip install -e .
+```
 
 ---
 
@@ -227,34 +267,15 @@ The long-term goal is to evolve enterprise knowledge platforms from passive data
 
 Built on ideas from:
 
-- Yann LeCun's Joint-Embedding Predictive Architecture (JEPA)
-- Neuro-symbolic AI and knowledge graph engineering
-- Self-supervised world models and representation learning
-- RDF/OWL/SHACL enterprise semantic standards
-- Constraint-guided and governance-aware AI systems
+- **Yann LeCun's Joint-Embedding Predictive Architecture (JEPA)** — the core self-supervised objective of aligning context and target representations in latent space, rather than predicting raw outputs
+- **Neuro-symbolic AI and knowledge graph engineering** — combining symbolic graph structure with neural representation learning
+- **Self-supervised world models and representation learning** — learning predictive models of structured environments without explicit supervision
 
 ---
 
 ## Future Directions
 
-- Temporal enterprise state modeling with graph sequence encoders
-- Multi-agent organisational simulation
-- Reinforcement learning over KG state spaces
-- SHACL-guided constrained decoding
-- Live KG ingestion from Corporate Memory / triplestore endpoints
-- Causal intervention simulation (do-calculus over enterprise KGs)
-- Autonomous governance-aware copilots
-
----
-
-## License
-
-MIT License. See `LICENSE` for details.
-
----
-
-## Vision
-
-> "The future enterprise will not merely store knowledge, it will simulate itself."
-
-JEPA-KG is a step toward organisations that understand their own internal dynamics: systems that can look at a disruption, a regulatory change, or a strategic decision and reason through the consequences, before they happen.
+- **Graph-native latent representations** — move beyond serialising KGs to text; apply JEPA alignment directly in the embedding space of graph neural networks
+- **Temporal KG modelling** — extend to sequences of KG snapshots, enabling the model to learn how graph structure evolves over time
+- **Causal intervention simulation** — support do-calculus-style reasoning over KG state spaces to answer counterfactual questions
+- **Reinforcement learning over KG state spaces** — train agents to navigate and modify KG structure guided by JEPA-based world models
