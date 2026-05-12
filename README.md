@@ -126,9 +126,8 @@ python enterprise_world_model.py
 This will:
 
 1. Load the base model (Gemma-2-2B-IT by default)
-2. Run predictions for all five enterprise scenarios
-3. Display structured predictions in the terminal
-4. Export scenario KG structures to `enterprise_scenarios.json`
+2. Display structured predictions in the terminal
+3. Export scenario KG structures to `enterprise_scenarios.json`
 
 ### Enable Fine-Tuning
 
