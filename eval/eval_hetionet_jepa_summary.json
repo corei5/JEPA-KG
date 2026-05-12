@@ -1,0 +1,92 @@
+{
+  "model": "trained_models/ft-hetionet-jepa-2e-5-0.05-42",
+  "input_file": "datasets/hetionet_test.jsonl",
+  "n_examples": 199,
+  "overall": {
+    "precision": 0.084659021727609,
+    "recall": 0.09447499166021078,
+    "f1": 0.08641486493322123
+  },
+  "per_priority": {
+    "Side Effects": {
+      "recall": 0.017164179104477612,
+      "f1": 0.016915422885572143,
+      "n": 134
+    },
+    "Similar Compounds": {
+      "recall": 0.1079961464354528,
+      "f1": 0.08562253417744747,
+      "n": 173
+    },
+    "Pharmacologic Classes": {
+      "recall": 0.07115384615384615,
+      "f1": 0.07743589743589743,
+      "n": 130
+    },
+    "Gene Bindings": {
+      "recall": 0.12186897880539499,
+      "f1": 0.1049224699513717,
+      "n": 173
+    },
+    "Gene Associations": {
+      "recall": 0.015384615384615385,
+      "f1": 0.017094017094017096,
+      "n": 26
+    },
+    "Symptom Presentations": {
+      "recall": 0.038461538461538464,
+      "f1": 0.040170940170940174,
+      "n": 26
+    },
+    "Similar Diseases": {
+      "recall": 0.3053333333333333,
+      "f1": 0.1861904761904762,
+      "n": 25
+    },
+    "Anatomical Localizations": {
+      "recall": 0.02307692307692308,
+      "f1": 0.023931623931623937,
+      "n": 26
+    },
+    "Gene Upregulations": {
+      "recall": 0.003048780487804878,
+      "f1": 0.0027100271002710027,
+      "n": 82
+    },
+    "Gene Downregulations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 84
+    },
+    "Disease Treatments": {
+      "recall": 0.1187719298245614,
+      "f1": 0.12760233918128655,
+      "n": 95
+    },
+    "Downregulated Genes": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 9
+    },
+    "Upregulated Genes": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 9
+    },
+    "Palliating Compounds": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 14
+    },
+    "Treatment Compounds": {
+      "recall": 0.2021739130434783,
+      "f1": 0.15386473429951691,
+      "n": 23
+    },
+    "Disease Palliations": {
+      "recall": 0.09375,
+      "f1": 0.07291666666666667,
+      "n": 32
+    }
+  }
+}

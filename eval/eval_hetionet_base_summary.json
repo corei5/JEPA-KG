@@ -1,0 +1,97 @@
+{
+  "model": "meta-llama/Llama-3.2-1B-Instruct",
+  "input_file": "datasets/hetionet_test.jsonl",
+  "n_examples": 199,
+  "overall": {
+    "precision": 0.009184812953657175,
+    "recall": 0.0034343727182923165,
+    "f1": 0.0046998318314451564
+  },
+  "per_priority": {
+    "Side Effects": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 123
+    },
+    "Gene Bindings": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 151
+    },
+    "Pharmacologic Classes": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 75
+    },
+    "Similar Compounds": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 147
+    },
+    "Similar Diseases": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 24
+    },
+    "Symptom Presentations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 25
+    },
+    "Gene Associations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 26
+    },
+    "Anatomical Localizations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 25
+    },
+    "Gene Downregulations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 82
+    },
+    "Gene Upregulations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 79
+    },
+    "Disease Treatments": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 43
+    },
+    "Downregulated Genes": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 8
+    },
+    "Palliating Compounds": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 8
+    },
+    "Upregulated Genes": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 8
+    },
+    "unknown": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 38
+    },
+    "Disease Palliations": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 25
+    },
+    "Treatment Compounds": {
+      "recall": 0.0,
+      "f1": 0.0,
+      "n": 15
+    }
+  }
+}
