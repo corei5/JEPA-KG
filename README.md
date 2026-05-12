@@ -9,7 +9,7 @@
 
 ## What Is This?
 
-JEPA-KG is a **neuro-symbolic enterprise world model** — a compact, predictive model of how an organisation's objects, rules, processes, people, systems, and external constraints interact and evolve over time.
+JEPA-KG is a **neuro-symbolic enterprise world model**, a compact, predictive model of how an organisation's objects, rules, processes, people, systems, and external constraints interact and evolve over time.
 
 It moves beyond standard LLMs (which predict tokens) by learning **causal enterprise dynamics**: given a structured Knowledge Graph representation of an organisational state, it predicts how that state transitions — across supply chains, compliance obligations, business processes, data pipelines, and strategic scenarios.
 
@@ -19,9 +19,9 @@ It moves beyond standard LLMs (which predict tokens) by learning **causal enterp
 
 | # | Task | What It Does |
 |---|------|-------------|
-| 1 | **Supply Chain Cascade Prediction** | Given a component delay, predicts every downstream production, financial, and contractual impact — step by step |
+| 1 | **Supply Chain Cascade Prediction** | Given a component delay, predicts every downstream production, financial, and contractual impact step by step |
 | 2 | **Compliance Obligation Inference** | Given a product, its markets, and known regulations, infers *all* missing compliance obligations, including those not yet stated |
-| 3 | **Process Violation Prediction** | Scans a running business process against its constraints and predicts which steps will breach SLAs, regulations, or policies — before they do |
+| 3 | **Process Violation Prediction** | Scans a running business process against its constraints and predicts which steps will breach SLAs, regulations, or policies before they do |
 | 4 | **Data Quality Defect Prediction** | Analyses a data pipeline and its recent changes to predict data quality failures before they corrupt downstream reports and decisions |
 | 5 | **Business Impact Simulation** | Simulates the full financial, operational, regulatory, and ESG impact of changing a supplier, material, policy, or workflow |
 
@@ -66,7 +66,7 @@ Learnable latent transition operators inserted between context and prediction:
 <|predictor_1|> ... <|predictor_8|>
 ```
 
-During training these tokens learn to encode enterprise state transitions in latent space. At inference they act as a "simulation buffer" between observed state and predicted outcome.
+During training, these tokens learn to encode enterprise state transitions in latent space. In inference, they act as a "simulation buffer" between the observed state and the predicted outcome.
 
 ### Modality Tokens
 
@@ -117,7 +117,7 @@ pip install torch transformers peft accelerate bitsandbytes datasets rich
 
 ### Run the Demo (Zero-Shot Mode)
 
-Runs all five enterprise tasks using the base LLM with structured KG prompts — no fine-tuning required:
+Runs all five enterprise tasks using the base LLM with structured KG prompts, no fine-tuning required:
 
 ```bash
 python enterprise_world_model.py
@@ -147,55 +147,7 @@ MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"   # or any HF causal LLM
 
 ---
 
-## Scenarios
 
-### 1 — Supply Chain Cascade Prediction
-
-**Domain:** Automotive
-
-**Situation:** Taiwan Semiconductor delays Microcontroller MCU-X7 by 6 weeks. Warehouse stock covers 3 days. The component has no qualified substitute. Plant Stuttgart produces 850 vehicles/day. OEM contract has a €120k/day penalty clause.
-
-**World Model Predicts:** Full cascade from stockout → ECU halt → line stoppage → financial exposure → ranked mitigation options with lead times and costs.
-
----
-
-### 2 — Compliance Obligation Inference
-
-**Domain:** Life Sciences / MedTech
-
-**Situation:** Class IIb medical device with an embedded ML decision module processing patient data. Launching simultaneously in EU, USA, and Japan.
-
-**World Model Predicts:** All applicable regulations including those not explicitly stated in the KG — EU MDR, EU AI Act, GDPR DPIA, FDA 510(k), FDA AI/ML SaMD PCCP, Japan PMDA approval, ISO 13485 — with priority ranking and deadline timeline.
-
----
-
-### 3 — Process Violation Prediction
-
-**Domain:** Financial Services
-
-**Situation:** Loan approval process running at 4,200 applications today. Experian API at 94% availability. Risk scoring ML model has flagged high feature drift. Income document uploads failing intermittently.
-
-**World Model Predicts:** Which specific process steps will breach which regulatory or SLA constraints, with probability, root cause signals, and prevention actions.
-
----
-
-### 4 — Data Quality Defect Prediction
-
-**Domain:** Data Engineering / Finance
-
-**Situation:** CRM-to-DWH pipeline runs nightly. A custom field migration completed yesterday. AccountRevenue field is flagged as unmapped. The CFO Board Report pulls from the DWH and is due tomorrow morning.
-
-**World Model Predicts:** Specific data defects before they corrupt the board report — null revenue fields, broken stage mappings, schema mismatches — with severity ratings and remediation steps.
-
----
-
-### 5 — Business Impact Simulation
-
-**Domain:** Pharmaceuticals
-
-**Situation:** Current solvent (ChemCo A, Solvent X22) is on the REACH SVHC candidate list. A compliant alternative (GreenChem B, BioSolvent Y11) exists at +18% cost premium but is not yet qualified. REACH restriction effective Q3 2026.
-
-**World Model Predicts:** Full simulation of the supplier switch — financial delta, GMP revalidation timeline, regulatory deadline clearance, ESG impact, and a phased decision recommendation.
 
 ---
 
@@ -303,6 +255,6 @@ MIT License. See `LICENSE` for details.
 
 ## Vision
 
-> "The future enterprise will not merely store knowledge — it will simulate itself."
+> "The future enterprise will not merely store knowledge, it will simulate itself."
 
-JEPA-KG is a step toward organisations that understand their own internal dynamics: systems that can look at a disruption, a regulatory change, or a strategic decision and reason through the consequences — before they happen.
+JEPA-KG is a step toward organisations that understand their own internal dynamics: systems that can look at a disruption, a regulatory change, or a strategic decision and reason through the consequences, before they happen.
